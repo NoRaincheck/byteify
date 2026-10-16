@@ -81,6 +81,12 @@ from .stitching import (
 )
 from .task_arithmetic import apply_delta, delta, task_arithmetic_merge
 from .vocab import VocabByteResolution, build_suffix_trie, resolve_token_bytes
+from .manifest import (
+    GateResults,
+    Manifest,
+    from_checkpoint,
+    export_with_manifest,
+)
 
 __all__ = [
     "SPECIAL_TOKENS",
@@ -133,6 +139,10 @@ __all__ = [
     "masked_l2",
     "merge_batch",
     "merge_boundaries",
+    "Manifest",
+    "GateResults",
+    "from_checkpoint",
+    "export_with_manifest",
     "mine_pairs",
     "pair_batches",
     "patch_index",

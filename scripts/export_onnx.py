@@ -18,11 +18,13 @@ the two disagree, the artifact is not trustworthy regardless of what the file lo
 """
 
 import argparse
+from pathlib import Path
 
 import torch
 from transformers import AutoModel, AutoTokenizer
 
 from byteify.inference import ByteifiedEmbedder, byte_ids_for_inference, export_onnx
+from byteify.manifest import export_with_manifest, from_checkpoint
 from byteify.source import HuggingFaceSourceEncoder, load_byteified_encoder
 
 SAMPLES = [
@@ -117,6 +119,25 @@ def main():
     )
     size_mb = __import__("os").path.getsize(path) / 1e6
     print(f"exported {path} ({size_mb:.1f} MB)")
+
+    # Write the manifest alongside the ONNX graph.  Hard-fail: if the
+    # manifest write fails, the ONNX file is already written but the
+    # artifact is not complete — a practitioner would know to remove it.
+    # (The manifest module validates itself; errors are raised early.)
+    onnx_dir = Path(args.out).parent
+    onnx_dir.mkdir(parents=True, exist_ok=True)
+    _, manifest_path, manifest = export_with_manifest(
+        checkpoint_dir=args.init if args.init else "",
+        output_dir=onnx_dir,
+        source_id=args.model,
+        source_revision="",
+        source=source,
+        tokenizer=tokenizer,
+        n_patches=args.n_patches,
+        max_bytes=args.max_bytes,
+    )
+    manifest.write_to(manifest_path)
+    print(f"wrote {manifest_path}")
 
     # --- numerical verification -------------------------------------------------
     with torch.no_grad():
