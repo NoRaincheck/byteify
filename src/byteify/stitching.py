@@ -15,6 +15,7 @@ Hwang et al. do; the paper found n = 4 substantially better for a small compute 
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -25,18 +26,25 @@ from torch import Tensor
 from .alignment import align_text, discover_special_bytes
 from .expand import expand_byte_ids
 
-_SHARED: dict = {}
+_SHARED: weakref.WeakKeyDictionary[object, tuple] = weakref.WeakKeyDictionary()
 
 
 def tokenizer_tables(tokenizer):
-    """Cache per-tokenizer tables: special pseudo-bytes and the suffix trie."""
-    key = id(tokenizer)
-    if key not in _SHARED:
-        from .vocab import build_suffix_trie
+    """Cache per-tokenizer tables: special pseudo-bytes and the suffix trie.
 
-        trie, resolution = build_suffix_trie(tokenizer)
-        _SHARED[key] = (discover_special_bytes(tokenizer), trie, resolution)
-    return _SHARED[key]
+    Keyed on the tokenizer object rather than ``id()``: the address is recycled once the
+    tokenizer is collected, and a process that byteifies several models can otherwise be
+    handed the previous model's trie.
+    """
+    hit = _SHARED.get(tokenizer)
+    if hit is not None:
+        return hit
+    from .vocab import build_suffix_trie
+
+    trie, resolution = build_suffix_trie(tokenizer)
+    tables = (discover_special_bytes(tokenizer), trie, resolution)
+    _SHARED[tokenizer] = tables
+    return tables
 
 
 @dataclass

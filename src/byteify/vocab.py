@@ -36,6 +36,7 @@ Two properties are *not* recoverable and are handled explicitly:
 from __future__ import annotations
 
 import re
+import weakref
 from dataclasses import dataclass, field
 
 from .alignment import SPECIAL_TOKENS, bytes_to_unicode
@@ -96,8 +97,14 @@ def _detect_strategy(tokenizer) -> str:
     return "literal"
 
 
-_RESOLUTION_CACHE: dict[int, VocabByteResolution] = {}
-_SPECIAL_CACHE: dict[int, set[int]] = {}
+# Keyed on the tokenizer itself, not on its address. ``id()`` is recycled once the
+# tokenizer is collected, so an id-keyed dict can hand one tokenizer's vocabulary to a
+# different tokenizer that landed on the same address. A weak key drops the entry when the
+# tokenizer dies, which closes both that hole and the unbounded growth.
+_RESOLUTION_CACHE: weakref.WeakKeyDictionary[object, VocabByteResolution] = (
+    weakref.WeakKeyDictionary()
+)
+_SPECIAL_CACHE: weakref.WeakKeyDictionary[object, set[int]] = weakref.WeakKeyDictionary()
 
 
 def resolve_token_bytes(tokenizer, *, use_cache: bool = True) -> VocabByteResolution:
@@ -106,12 +113,13 @@ def resolve_token_bytes(tokenizer, *, use_cache: bool = True) -> VocabByteResolu
     Cached per tokenizer: building this walks the whole vocabulary, and the alignment
     path calls it once per training example, which dominated preprocessing cost.
     """
-    key = id(tokenizer)
-    if use_cache and key in _RESOLUTION_CACHE:
-        return _RESOLUTION_CACHE[key]
+    if use_cache:
+        hit = _RESOLUTION_CACHE.get(tokenizer)
+        if hit is not None:
+            return hit
     result = _resolve_token_bytes(tokenizer)
     if use_cache:
-        _RESOLUTION_CACHE[key] = result
+        _RESOLUTION_CACHE[tokenizer] = result
     return result
 
 
@@ -189,9 +197,9 @@ def added_tokens(tokenizer) -> list[tuple[int, str, bool]]:
 
 
 def _special_ids(tokenizer) -> set[int]:
-    key = id(tokenizer)
-    if key in _SPECIAL_CACHE:
-        return _SPECIAL_CACHE[key]
+    hit = _SPECIAL_CACHE.get(tokenizer)
+    if hit is not None:
+        return hit
     ids = {token_id for token_id, content, _ in added_tokens(tokenizer) if content in SPECIAL_TOKENS}
     for token_id, _, special in added_tokens(tokenizer):
         if special:
@@ -200,7 +208,7 @@ def _special_ids(tokenizer) -> set[int]:
         value = getattr(tokenizer, attr, None)
         if isinstance(value, int):
             ids.add(value)
-    _SPECIAL_CACHE[key] = ids
+    _SPECIAL_CACHE[tokenizer] = ids
     return ids
 
 
