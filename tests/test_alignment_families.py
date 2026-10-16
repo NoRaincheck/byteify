@@ -148,22 +148,23 @@ def test_align_from_offsets_rejects_out_of_range_offsets():
         align_from_offsets("abc", [1], [(0, 99)])
 
 
-def test_bytelevel_offsets_are_unreliable_for_multibyte():
-    """Documents why byte-level BPE must not be aligned via offsets.
-
-    The fast tokenizer reports overlapping duplicate spans for consecutive tokens in
-    CJK text, so an offset-driven byte stream duplicates characters. Concatenating
-    per-token bytes is the only correct route for this family.
+def test_bytelevel_offsets_overlap_but_cursor_handles_it():
+    """Byte-level BPE reports overlapping duplicate spans for CJK text, but
+    the cursor-based alignment in ``align_from_offsets`` skips overlaps
+    (``start_byte = cursor``), so the offset route now agrees with the
+    token-concatenation route.
     """
     tok = _load(BYTE_LEVEL_MODELS[0])
     text = "日本語のテキスト"
     encoded = tok(text, add_special_tokens=False, return_offsets_mapping=True)
     spans = [o for o in encoded["offset_mapping"] if o[1] > o[0]]
     assert len(spans) != len(set(spans)), "expected duplicate offsets for this input"
-    # The offset route therefore disagrees with the authoritative token route.
+    # The cursor-based offset route now agrees with concatenating per-token bytes.
     by_offsets = align_from_offsets(text, encoded["input_ids"], encoded["offset_mapping"])
     by_tokens = align_text(text, tok, add_special_tokens=False)
-    assert list(by_offsets.byte_ids) != list(by_tokens.byte_ids)
+    assert list(by_offsets.byte_ids) == list(by_tokens.byte_ids), (
+        "cursor handling makes the offset route agree with the token route"
+    )
     assert by_tokens.n_bytes == len(text.encode("utf-8"))
 
 

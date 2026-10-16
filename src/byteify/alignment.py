@@ -151,23 +151,44 @@ def align_from_offsets(
     cursor = 0  # next unassigned byte
 
     for i, (start, end) in enumerate(offsets):
-        if i not in real_indices:
-            # Special token: one pseudo-byte patch, if we know which one.
-            pseudo = special_token_ids.get(token_ids[i])
-            if pseudo is None:
-                lengths.append(0)
-                continue
+        # Special tokens always get a pseudo-byte, regardless of offset.  Some
+        # tokenizers (wordpiece / SentencePiece) report non-zero spans for [CLS]
+        # and [SEP]; the previous code treated them as real tokens and emitted
+        # the bytes for the covered text, which broke the byte-to-token mapping
+        # at the source.  We emit the pseudo-byte AND the text bytes so the
+        # byte stream still covers the full text, but the token that owns the
+        # bytes is recorded as a special (one-byte patch).
+        pseudo = special_token_ids.get(token_ids[i])
+        if pseudo is not None:
             byte_ids.append(pseudo)
-            lengths.append(1)
-            boundaries.append(1)
+            lengths.append(0)  # will be set below
+            boundaries.append(1)  # the pseudo-byte is the entire token (zero-width)
+            # Also emit the bytes for the covered text (e.g. [CLS] covering
+            # "byte").  This restores the original behaviour of emitting the
+            # covered text, which is necessary for the byte axis to remain
+            # lossless, but marks the token as a single-byte pseudo-byte patch
+            # so the byte-to-token boundary map stays correct.
+            if i in real_indices:
+                char_start_b = char_to_byte[start]
+                char_end_b = char_to_byte[end]
+                chunk = data[char_start_b:char_end_b]
+                byte_ids.extend(chunk)
+                lengths[-1] = 1 + len(chunk)  # pseudo-byte + text bytes
+                boundaries[-1] = 0  # no longer the last entry
+                boundaries.extend([0] * len(chunk))
+                boundaries[-1] = 1  # last entry of the token is a boundary
+            else:
+                lengths[-1] = 1  # just the pseudo-byte
+            end_b = char_to_byte[min(end, len(text))]
+            cursor = max(cursor, end_b)
             continue
 
-        # Begin at the cursor, not at the token's own start, so that bytes no token
-        # covers are absorbed into this token instead of vanishing. (Using max here
-        # would skip the gap and desynchronise the byte and patch axes.)
+        # Always emit from the cursor.  This absorbs gaps (uncovered bytes
+        # between tokens) for WordPiece and skips overlaps (duplicate spans)
+        # for SentencePiece, whichever case applies.
         char_start_b = char_to_byte[start]
         char_end_b = char_to_byte[end]
-        start_byte = min(char_start_b, cursor)
+        start_byte = cursor
         end_byte = max(char_end_b, start_byte)
 
         # Tokens can map to an empty span after normalization (e.g. a lone accent
@@ -258,8 +279,18 @@ def align_text(
         return align(token_ids, parts)
 
     encoded = tokenizer(text, add_special_tokens=add_special_tokens, return_offsets_mapping=True)
+
+    # For WordPiece (and other families that apply a normalizer), the offsets are
+    # computed on the normalizer's output, not the original text.  We must also
+    # use the normalizer's output as the byte-source, otherwise the byte stream
+    # will disagree with the offsets (e.g. "Byte" vs "byte" differs by one byte).
+    normalizer = getattr(getattr(tokenizer, "backend_tokenizer", None), "normalizer", None)
+    normalised_text = (
+        normalizer.normalize_str(text) if normalizer is not None else text
+    )
     return align_from_offsets(
-        text, encoded["input_ids"], encoded["offset_mapping"], special_token_ids=special_token_ids
+        normalised_text, encoded["input_ids"], encoded["offset_mapping"],
+        special_token_ids=special_token_ids,
     )
 
 
