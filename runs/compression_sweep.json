@@ -1,0 +1,57 @@
+[
+  {
+    "target": NaN,
+    "achieved": 4.619968935683752,
+    "bytes_per_patch": 4.619968935683752,
+    "sim_corr": 0.7918595770994822,
+    "cos_emb_c": 0.7830600341161092,
+    "nn_agree": 0.5833333333333334,
+    "boundary_acc": 0.9409157931804657,
+    "cos_depth": 0.8516154984633127
+  },
+  {
+    "target": 4.3,
+    "achieved": 4.7003383757961785,
+    "sim_corr": 0.7813797394434611,
+    "cos_emb_c": 0.781167209148407,
+    "nn_agree": 0.625,
+    "boundary_acc": 0.9394395649433136,
+    "cos_depth": NaN
+  },
+  {
+    "target": 6.0,
+    "achieved": 5.998094996189993,
+    "sim_corr": 0.5921503454446793,
+    "cos_emb_c": 0.6751773456732432,
+    "nn_agree": 0.375,
+    "boundary_acc": 0.9123582641283671,
+    "cos_depth": NaN
+  },
+  {
+    "target": 8.0,
+    "achieved": 7.953688110474907,
+    "sim_corr": 0.5212257454792658,
+    "cos_emb_c": 0.6063314179579417,
+    "nn_agree": 0.25,
+    "boundary_acc": 0.884703536828359,
+    "cos_depth": NaN
+  },
+  {
+    "target": 12.0,
+    "achieved": 11.929527658499621,
+    "sim_corr": 0.394034706056118,
+    "cos_emb_c": 0.5154784371455511,
+    "nn_agree": 0.22916666666666666,
+    "boundary_acc": 0.8532566130161285,
+    "cos_depth": NaN
+  },
+  {
+    "target": 16.0,
+    "achieved": 15.79037111334002,
+    "sim_corr": 0.4189817433555921,
+    "cos_emb_c": 0.49523184696833294,
+    "nn_agree": 0.25,
+    "boundary_acc": 0.8396500051021576,
+    "cos_depth": NaN
+  }
+]

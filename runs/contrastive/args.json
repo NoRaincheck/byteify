@@ -1,0 +1,26 @@
+{
+  "model": "jhu-clsp/ettin-encoder-17m",
+  "init": "runs/stage1/stage1.pt",
+  "data": [
+    "data/corpus/fineweb-edu.jsonl"
+  ],
+  "steps": 60,
+  "batch_size": 8,
+  "max_bytes": 192,
+  "n_patches": 32,
+  "lr": 2e-05,
+  "local_lr_mult": 10.0,
+  "weight_decay": 0.1,
+  "warmup": 50,
+  "temperature": 0.05,
+  "proj_dim": 0,
+  "pairs_per_anchor": 1,
+  "pool_size": 64,
+  "mine_texts": 300,
+  "freeze_source": true,
+  "seed": 0,
+  "device": "mps",
+  "out": "runs/contrastive",
+  "log_every": 20,
+  "empty_cache_every": 100
+}
