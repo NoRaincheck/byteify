@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Training corpora and any other downloaded data.
+# Regenerate with scripts/prepare_corpus.py; the shards are far too large for git.
+data/
+
+# Model artifacts: checkpoints and exported graphs are reproducible from the code plus a
+# seed, and are tens to hundreds of megabytes. Run histories (small JSON) ARE tracked so
+# the numbers in RESULTS.md can be traced back to the run that produced them.
+*.pt
+*.pth
+*.onnx
+*.onnx.data
+*.npz
+*.safetensors
+*.bin
+runs/**/*.log
+
+# Notebook / editor noise
+.ipynb_checkpoints/
+.DS_Store

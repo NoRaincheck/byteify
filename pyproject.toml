@@ -1,0 +1,41 @@
+[project]
+name = "byteify"
+version = "0.1.0"
+description = "Byteifying subword embedding models, starting with ettin-encoder-17m"
+readme = "README.md"
+authors = [
+    { name = "NoRaincheck", email = "2498638+NoRaincheck@users.noreply.github.com" }
+]
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "torch>=2.6",
+    "transformers>=4.48",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.9",
+]
+# ONNX export and its numerical verification. The dynamo exporter requires onnxscript,
+# and verification needs onnxruntime to actually run the graph.
+onnx = [
+    "onnx>=1.17",
+    "onnxscript>=0.2",
+    "onnxruntime>=1.20",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.uv.build-backend]
+module-name = "byteify"
+module-root = "src"
