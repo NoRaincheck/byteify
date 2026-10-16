@@ -170,16 +170,19 @@ class ByteifiedEmbedder(nn.Module):
     @torch.no_grad()
     def encode(self, tokenizer, texts: list[str], max_bytes: int = 512) -> Tensor:
         """Convenience path that also builds the byte inputs from a tokenizer."""
-        byte_ids, expanded, mask = [], [], []
-        for text in texts:
-            b, e, m = byte_ids_for_inference(tokenizer, text, max_bytes)
-            byte_ids.append(b)
-            expanded.append(e)
-            mask.append(m)
-        width = max(x.shape[1] for x in byte_ids)
-        pad = lambda xs, v: torch.stack([F.pad(x, (0, width - x.shape[1]), value=v) for x in xs])
+        rows = [byte_ids_for_inference(tokenizer, text, max_bytes) for text in texts]
+        width = max(ids.shape[1] for ids, _, _ in rows)
+
+        def pad(tensors: list[Tensor], value: int) -> Tensor:
+            padded = [F.pad(t, (0, width - t.shape[1]), value=value) for t in tensors]
+            # Each row already carries its batch axis, so these concatenate rather than
+            # stack -- stacking would add a spurious dimension and shift every axis.
+            return torch.cat(padded, dim=0)
+
         return self.forward(
-            pad(byte_ids, 0), pad(expanded, -1), torch.cat(mask, dim=1)
+            pad([ids for ids, _, _ in rows], 0),
+            pad([exp for _, exp, _ in rows], -1),
+            pad([mask for _, _, mask in rows], 0),
         )
 
 
