@@ -20,7 +20,25 @@ from .alignment import (
     discover_special_bytes,
 )
 from .boundary_merge import bpe_merge_patches, merge_batch, merge_boundaries
+from .contrastive import (
+    ContrastiveHead,
+    ProjectionHead,
+    infonce,
+    mine_pairs,
+    pair_batches,
+    retrieval_metrics,
+)
+from .data import BatchSampler, iter_texts
 from .expand import ByteTrie, expand_byte_ids
+from .losses import (
+    Stage1Weights,
+    boundary_loss,
+    embedding_loss,
+    masked_byte_loss,
+    pool,
+    sample_mlm_mask,
+    stitching_loss,
+)
 from .model import (
     ByteEmbedding,
     ByteifiedEncoder,
@@ -38,10 +56,43 @@ from .model import (
     pool_patches,
 )
 from .source import ByteifyConfig, SourceEncoder, resolve_source_encoder
+from .stitching import (
+    ByteBatch,
+    cos_sim,
+    encode_texts,
+    masked_l2,
+    teacher_states,
+    tokenizer_tables,
+)
+from .task_arithmetic import apply_delta, delta, task_arithmetic_merge
 from .vocab import VocabByteResolution, build_suffix_trie, resolve_token_bytes
 
 __all__ = [
     "SPECIAL_TOKENS",
+    "tokenizer_tables",
+    "teacher_states",
+    "task_arithmetic_merge",
+    "stitching_loss",
+    "sample_mlm_mask",
+    "retrieval_metrics",
+    "pool",
+    "pair_batches",
+    "mine_pairs",
+    "masked_l2",
+    "masked_byte_loss",
+    "iter_texts",
+    "infonce",
+    "encode_texts",
+    "embedding_loss",
+    "delta",
+    "cos_sim",
+    "boundary_loss",
+    "apply_delta",
+    "Stage1Weights",
+    "ProjectionHead",
+    "ContrastiveHead",
+    "ByteBatch",
+    "BatchSampler",
     "Alignment",
     "ByteEmbedding",
     "ByteTrie",

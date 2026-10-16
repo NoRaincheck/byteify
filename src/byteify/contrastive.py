@@ -1,0 +1,212 @@
+"""Contrastive training for the byteified embedder.
+
+Stage 1 recovers the source model's *behaviour* and Stage 2 teaches it byte-level
+competence, but neither optimises retrieval: both target representations, not the
+similarity structure a retriever is judged on. This module supplies the missing third
+stage -- the objective that actually makes the output useful as an embedding.
+
+Design notes
+------------
+**Symmetric InfoNCE with in-batch negatives.** Given an anchor and a positive for each of
+``B`` examples, the score matrix is the scaled dot product between the two views'
+normalised embeddings; the loss is the cross-entropy of the diagonal in both directions.
+In-batch negatives are what makes this cheap: a batch of ``B`` pairs yields ``B - 1``
+negatives for free, which matters here because every negative is a *byte-level forward
+pass*.
+
+**Temperature is learned**, bounded away from zero, as in SimCSE. A fixed temperature is
+a real hyperparameter at this scale; a learned one adapts to how concentrated the
+embedding space is.
+
+**The embedding is pooled over the budgeted patch axis**, exactly as at inference, so
+training optimises the representation that will actually be used rather than a
+train/inference mismatch.
+
+**Pairs come from wherever they can be sourced.** :func:`mine_pairs` builds them locally
+by embedding a corpus with the *source* model, so no external dataset is required and the
+positives are, by construction, near-duplicates of the anchors in the teacher's metric.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+
+class ProjectionHead(nn.Module):
+    """Optional MLP projection, as in SimCSE.
+
+    Retrieval is evaluated on the projected vector by default, matching that paper. Set
+    ``dim=0`` to train and evaluate the raw pooled embedding instead, which is the
+    convention used by E5/BGE-style models and by this project's fidelity metrics.
+    """
+
+    def __init__(self, d_model: int, dim: int = 0, hidden: int = 2048) -> None:
+        super().__init__()
+        self.enabled = dim > 0
+        if self.enabled:
+            self.net = nn.Sequential(
+                nn.Linear(d_model, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, dim),
+            )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x) if self.enabled else x
+
+
+@dataclass
+class ContrastiveLoss:
+    total: Tensor
+    anchor: Tensor
+    positive: Tensor
+    accuracy: Tensor
+    temperature: float
+
+
+def infonce(
+    anchor: Tensor,
+    positive: Tensor,
+    *,
+    temperature: Tensor | float = 0.05,
+) -> ContrastiveLoss:
+    """Symmetric InfoNCE with in-batch negatives.
+
+    anchor, positive: [B, D], unnormalised. Both are L2-normalised internally.
+
+    The score matrix is ``a @ p.T`` -- anchor *i* against positive *j*. The target is the
+    diagonal, so ``i == j`` is the true pair and every other column is a negative.
+    """
+    a = F.normalize(anchor.float(), dim=-1)
+    p = F.normalize(positive.float(), dim=-1)
+    logits = a @ p.T / temperature
+    labels = torch.arange(a.shape[0], device=a.device)
+
+    loss_a = F.cross_entropy(logits, labels)
+    loss_p = F.cross_entropy(logits.T, labels)
+    total = 0.5 * (loss_a + loss_p)
+
+    with torch.no_grad():
+        # Fraction of examples whose true positive is the nearest of the batch.
+        accuracy = (logits.argmax(dim=-1) == labels).float().mean()
+    # Detach: this is a logged statistic, and a grad-tracking scalar forces callers to
+    # remember `.detach()` at every logging site.
+    temp = float(temperature.detach()) if isinstance(temperature, Tensor) else float(temperature)
+    return ContrastiveLoss(
+        total=total, anchor=loss_a.detach(), positive=loss_p.detach(),
+        accuracy=accuracy, temperature=temp,
+    )
+
+
+class ContrastiveHead(nn.Module):
+    """Projection head plus a learned, bounded temperature."""
+
+    def __init__(self, d_model: int, proj_dim: int = 0, hidden: int = 2048, init_temp: float = 0.05) -> None:
+        super().__init__()
+        self.projection = ProjectionHead(d_model, proj_dim, hidden)
+        # Parameterised in log space and clamped so the softmax cannot collapse.
+        self.log_temperature = nn.Parameter(torch.tensor(math.log(init_temp)))
+
+    def temperature(self) -> Tensor:
+        return self.log_temperature.clamp(-4.0, 4.0).exp()
+
+    def forward(self, pooled: Tensor) -> tuple[Tensor, Tensor]:
+        return self.projection(pooled), self.temperature()
+
+
+@dataclass
+class PairBatch:
+    anchors: list[str]
+    positives: list[str]
+
+
+def mine_pairs(
+    texts: Sequence[str],
+    embed_fn: Callable[[Sequence[str]], Tensor],
+    *,
+    pool_size: int = 64,
+    n_per_anchor: int = 1,
+    temperature: float = 0.05,
+    seed: int = 0,
+) -> list[tuple[str, str]]:
+    """Mine positive pairs by nearest neighbours in the *source* model's space.
+
+    ``embed_fn`` maps a list of texts to normalised embeddings. Positives are the
+    ``n_per_anchor`` nearest neighbours of each anchor, excluding itself. Softmax
+    sampling over similarity temperature sharpens selection toward the hardest positives,
+    which are the informative ones.
+
+    This needs no external dataset and no byte-level forward passes: the source model is
+    already available and its metric is a sensible notion of "similar".
+    """
+    if len(texts) < 2:
+        return []
+    rng = random.Random(seed)
+    embeddings = F.normalize(embed_fn(list(texts)).float(), dim=-1)
+
+    pairs: list[tuple[str, str]] = []
+    for start in range(0, len(texts), pool_size):
+        window = list(range(start, min(start + pool_size, len(texts))))
+        block = embeddings[window]
+        sim = block @ block.T / temperature
+        sim.fill_diagonal_(float("-inf"))
+        weights = torch.softmax(sim, dim=-1).cpu()
+        for row, anchor_idx in enumerate(window):
+            picks = torch.multinomial(weights[row], min(n_per_anchor, len(window) - 1))
+            for pick in picks.tolist():
+                pairs.append((texts[anchor_idx], texts[window[pick]]))
+    rng.shuffle(pairs)
+    return pairs
+
+
+def pair_batches(
+    pairs: Sequence[tuple[str, str]], batch_size: int, seed: int = 0
+) -> Iterable[list[tuple[str, str]]]:
+    """Shuffled fixed-size batches over pairs."""
+    order = list(pairs)
+    random.Random(seed).shuffle(order)
+    for i in range(0, len(order) - batch_size + 1, batch_size):
+        yield order[i : i + batch_size]
+
+
+def retrieval_metrics(
+    query_embeddings: Tensor,
+    doc_embeddings: Tensor,
+    relevant: dict[int, list[int]],
+) -> dict[str, float]:
+    """Recall@k, MRR and nDCG for a query -> document similarity matrix.
+
+    ``relevant`` maps a query index to the indices of documents that answer it.
+    Anisotropy matters here as much as anywhere else in this project, so recall is the
+    primary number: it is insensitive to the common direction that inflates cosine.
+    """
+    q = F.normalize(query_embeddings.float(), dim=-1)
+    d = F.normalize(doc_embeddings.float(), dim=-1)
+    sim = q @ d.T
+    ranks = sim.argsort(dim=-1, descending=True)
+
+    recalls = {1: 0.0, 5: 0.0, 10: 0.0}
+    mrr = 0.0
+    ndcg = 0.0
+    for qi, gold in relevant.items():
+        order = ranks[qi].tolist()
+        position = {doc_id: rank for rank, doc_id in enumerate(order)}
+        best = min((position[g] for g in gold if g in position), default=len(order))
+        for k in recalls:
+            recalls[k] += float(best < k)
+        mrr += 1.0 / (best + 1)
+        gains = [1.0 / math.log2(rank + 2) for rank, g in enumerate(order) if g in gold]
+        ideal = [1.0 / math.log2(i + 2) for i in range(len(gold))]
+        ndcg += sum(gains) / max(sum(ideal), 1e-9)
+
+    n = max(len(relevant), 1)
+    out = {f"recall@{k}": v / n for k, v in recalls.items()}
+    out["mrr"] = mrr / n
+    out["ndcg"] = ndcg / n
+    return out
