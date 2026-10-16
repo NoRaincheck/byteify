@@ -10,6 +10,31 @@ Terms marked **→ Here** differ from the paper's usage. The paper describes a d
 language model; this project ports the method to a bidirectional encoder, and a few terms
 change meaning in the process.
 
+## Levels and guarantees
+
+**Byteification level**:
+A rung on the ladder of how far a byteified model has been trained away from its source model.
+Each level names a guarantee it makes about the artifact it produces and a gate that artifact
+must pass. _Avoid_: level (when the patch budget is meant), quality tier, preset, grade
+
+**Recipe**:
+The training procedure behind a byteification level. Never part of the user's contract — the
+level is the interface, the recipe is the implementation behind it. Stage 1 and Stage 2 are
+named recipes, not levels. _Avoid_: level, mode, stage
+
+**Guarantee**:
+The checkable property a byteification level claims about its artifact, stated as a measured
+quantity rather than an assertion. _Avoid_: feature, capability, promise
+
+**Gate**:
+The check an artifact must pass to be accepted as belonging to a byteification level. The
+guarantee is what the level claims; the gate is what proves it. _Avoid_: test, validation, CI
+
+**Serving artifact**:
+The terminal deliverable of a byteification: a byte-native encoder graph with a fixed byte axis
+and a fixed patch budget, deployable without a source tokenizer. _Avoid_: model, checkpoint,
+export
+
 ## The retrofit
 
 **Byteification**:
@@ -74,7 +99,8 @@ Mean bytes per patch.
 _Avoid_: compression factor (ambiguous about units)
 
 **Patch budget**:
-The fixed maximum number of patches a byteified encoder will emit.
+The fixed maximum number of patches a byteified encoder will emit. Distinct from a
+**byteification level**, which is about how far a model has been trained from its source.
 _Avoid_: max_patches (an implementation name, not a concept)
 
 **Budgeted patching**:
