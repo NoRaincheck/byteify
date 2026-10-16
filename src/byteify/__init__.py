@@ -21,12 +21,43 @@ from .alignment import (
 )
 from .boundary_merge import bpe_merge_patches, merge_batch, merge_boundaries
 from .expand import ByteTrie, expand_byte_ids
+from .model import (
+    ByteEmbedding,
+    ByteifiedEncoder,
+    ByteifiedEncoderOutput,
+    CosineBoundaryPredictor,
+    Depooling,
+    LocalAttention,
+    LocalContextEncoder,
+    LocalFeedForward,
+    LocalGRU,
+    MLPBoundaryPredictor,
+    PartialModernBert,
+    RMSNorm,
+    patch_index,
+    pool_patches,
+)
+from .source import ByteifyConfig, SourceEncoder, resolve_source_encoder
 from .vocab import VocabByteResolution, build_suffix_trie, resolve_token_bytes
 
 __all__ = [
     "SPECIAL_TOKENS",
     "Alignment",
+    "ByteEmbedding",
     "ByteTrie",
+    "ByteifiedEncoder",
+    "ByteifiedEncoderOutput",
+    "ByteifyConfig",
+    "CosineBoundaryPredictor",
+    "Depooling",
+    "LocalAttention",
+    "LocalContextEncoder",
+    "LocalFeedForward",
+    "LocalGRU",
+    "MLPBoundaryPredictor",
+    "PartialModernBert",
+    "RMSNorm",
+    "SourceEncoder",
     "VocabByteResolution",
     "align",
     "align_from_offsets",
