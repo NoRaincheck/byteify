@@ -185,6 +185,78 @@ class ByteifiedEmbedder(nn.Module):
             pad([mask for _, _, mask in rows], 0),
         )
 
+    @classmethod
+    def from_manifest(
+        cls,
+        manifest: Manifest,
+        device: str = "cpu",
+    ) -> ByteifiedEmbedder:
+        """Reconstruct an embedder from a manifest + checkpoint.
+
+        Reads ``stage1.pt`` from the manifest's checkpoint directory (or
+        the same directory where the manifest lives), loads the encoder
+        weights, and returns a ``ByteifiedEmbedder`` ready for inference.
+
+        Args:
+            manifest: a validated ``Manifest`` object.
+            device: device string (default ``"cpu"``).
+
+        Returns:
+            A fully-constructed ``ByteifiedEmbedder``.
+        """
+        from .source import (
+            LocalEncoderSpec,
+            build_byteified_encoder,
+            HuggingFaceSourceEncoder,
+            load_byteified_encoder,
+        )
+        from transformers import AutoModel, AutoTokenizer
+
+        # Resolve the checkpoint directory from the manifest.  The
+        # manifest stores source_id but not the path; the convention is
+        # that the checkpoint directory is named after the source_id
+        # (with "/" replaced by "_").
+        import os
+        from pathlib import Path
+
+        ckpt_dir = Path(os.path.expanduser(
+            os.path.join("runs", manifest.source_id.replace("/", "_"))
+        ))
+
+        # Build source model and tokenizer from the manifest's source_id.
+        tokenizer = AutoTokenizer.from_pretrained(manifest.source_id)
+        source = HuggingFaceSourceEncoder(AutoModel.from_pretrained(manifest.source_id)).to(device)
+        source.eval()
+
+        # Build the byteified encoder from the manifest.
+        encoder_arch = manifest.encoder_arch
+        encoder = build_byteified_encoder(
+            source,
+            tokenizer,
+            LocalEncoderSpec(
+                layers=encoder_arch.get('layers', 1),
+                backend=encoder_arch.get('backend', 'attention'),
+                window=encoder_arch.get('window', 128),
+                ffn_hidden=encoder_arch.get('ffn_hidden', 1024),
+                boundary_predictor=encoder_arch.get('boundary_predictor', 'mlp'),
+            ),
+        ).to(device)
+
+        # Try to load weights from checkpoint if it exists.
+        pt_path = ckpt_dir / "stage1.pt"
+        if pt_path.exists():
+            encoder = load_byteified_encoder(str(pt_path), source, tokenizer).to(device)
+
+        encoder = encoder.eval()
+
+        return cls(
+            encoder=encoder,
+            source=source,
+            n_patches=manifest.budget,
+            threshold=0.5,
+            normalize=True,
+        )
+
 
 def _embedder_core(
     encoder: nn.Module,
