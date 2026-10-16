@@ -37,8 +37,13 @@ from transformers import AutoModel, AutoTokenizer
 
 from byteify.data import BatchSampler, iter_texts
 from byteify.losses import boundary_loss, masked_byte_loss, sample_mlm_mask
-from byteify.model import ByteifiedEncoder, ByteMLMHead, LocalContextEncoder
-from byteify.source import HuggingFaceSourceEncoder
+from byteify.model import ByteMLMHead
+from byteify.source import (
+    HuggingFaceSourceEncoder,
+    LocalEncoderSpec,
+    build_byteified_encoder,
+    load_byteified_encoder,
+)
 from byteify.stitching import encode_texts
 
 
@@ -107,36 +112,24 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     source = HuggingFaceSourceEncoder(AutoModel.from_pretrained(args.model)).to(device)
 
-    from byteify.alignment import discover_special_bytes
-    from byteify.vocab import resolve_token_bytes
-
-    resolution = resolve_token_bytes(tokenizer)
-    specials = discover_special_bytes(tokenizer)
-
-    encoder = ByteifiedEncoder(
-        d_model=source.d_model,
-        n_byte_values=256 + len(specials),
-        subword_vocab_size=resolution.vocab_size,
-        local_encoder=LocalContextEncoder(
-            source.d_model,
-            n_layers=1,
-            ffn_hidden=1024,
-            n_heads=source.n_attention_heads,
-            window=128,
-        ),
-        boundary_predictor="mlp",
-        local_decoder_layers=args.out_layers,
-        local_decoder_ffn_hidden=args.out_ffn,
-        n_heads=source.n_attention_heads,
-    ).to(device)
-    head = ByteMLMHead(source.d_model).to(device)
-
     if args.init:
-        ckpt = torch.load(args.init, map_location=device, weights_only=False)
-        missing = encoder.load_state_dict(ckpt["encoder"], strict=False)
-        print(f"loaded Stage 1 from {args.init} (missing={len(missing.missing_keys)}, "
-              f"unexpected={len(missing.unexpected_keys)})")
+        # The architecture comes out of the checkpoint, not out of constants here.
+        encoder = load_byteified_encoder(args.init, source, tokenizer).to(device)
+        print(f"loaded Stage 1 from {args.init}")
     else:
+        encoder = build_byteified_encoder(
+            source,
+            tokenizer,
+            LocalEncoderSpec(
+                layers=1,
+                backend="attention",
+                window=128,
+                ffn_hidden=1024,
+                boundary_predictor="mlp",
+            ),
+        ).to(device)
+        encoder.embed.load_suffix_from(source.embedding_matrix())
+        print("no --init given: local encoder initialised from source embeddings")
         encoder.embed.load_suffix_from(source.embedding_matrix())
         print("no --init given: initialising the suffix table from the source embeddings")
 

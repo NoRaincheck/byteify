@@ -63,7 +63,14 @@ from .model import (
     patch_index,
     pool_patches,
 )
-from .source import ByteifyConfig, SourceEncoder, resolve_source_encoder
+from .source import (
+    ByteifyConfig,
+    LocalEncoderSpec,
+    SourceEncoder,
+    build_byteified_encoder,
+    load_byteified_encoder,
+    resolve_source_encoder,
+)
 from .stitching import (
     ByteBatch,
     cos_sim,
@@ -92,6 +99,7 @@ __all__ = [
     "Depooling",
     "LocalAttention",
     "LocalContextEncoder",
+    "LocalEncoderSpec",
     "LocalFeedForward",
     "LocalGRU",
     "MLPBoundaryPredictor",
@@ -108,6 +116,7 @@ __all__ = [
     "boundary_loss",
     "bpe_merge_patches",
     "budgeted_patches_mask",
+    "build_byteified_encoder",
     "build_suffix_trie",
     "bytes_to_unicode",
     "cos_sim",
@@ -119,6 +128,7 @@ __all__ = [
     "export_onnx",
     "infonce",
     "iter_texts",
+    "load_byteified_encoder",
     "masked_byte_loss",
     "masked_l2",
     "merge_batch",

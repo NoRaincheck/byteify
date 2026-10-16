@@ -167,21 +167,16 @@ def main() -> None:
     )
     print(f"tokenizer: {resolution.describe()}, special pseudo-bytes={len(specials)}")
 
-    from byteify.model import LocalContextEncoder
-
-    encoder = ByteifiedEncoder(
-        d_model=source.d_model,
-        n_byte_values=n_byte_values,
-        subword_vocab_size=resolution.vocab_size,
-        local_encoder=LocalContextEncoder(
-            source.d_model,
-            n_layers=cfg.local_layers,
-            ffn_hidden=cfg.local_ffn_hidden,
-            n_heads=source.n_attention_heads,
-            window=cfg.local_window,
+    encoder = build_byteified_encoder(
+        source,
+        tokenizer,
+        LocalEncoderSpec(
+            layers=cfg.local_layers,
             backend=cfg.local_backend,
+            window=cfg.local_window,
+            ffn_hidden=cfg.local_ffn_hidden,
+            boundary_predictor=cfg.boundary_predictor,
         ),
-        boundary_predictor=cfg.boundary_predictor,
     ).to(device)
     encoder.embed.load_suffix_from(source.embedding_matrix())
     # The suffix table is *reused* capacity: it is initialised to the source model's own

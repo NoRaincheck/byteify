@@ -26,8 +26,7 @@ from byteify.data import iter_texts
 from byteify.inference import (
     ByteifiedEmbedder,
 )
-from byteify.model import ByteifiedEncoder, LocalContextEncoder
-from byteify.source import HuggingFaceSourceEncoder
+from byteify.source import HuggingFaceSourceEncoder, load_byteified_encoder
 from byteify.stitching import encode_texts
 
 
@@ -90,27 +89,14 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     source = HuggingFaceSourceEncoder(AutoModel.from_pretrained(args.model)).to(device).eval()
 
-    from byteify.alignment import discover_special_bytes
-    from byteify.vocab import resolve_token_bytes
-
-    resolution = resolve_token_bytes(tokenizer)
-    specials = discover_special_bytes(tokenizer)
-
-    encoder = ByteifiedEncoder(
-        d_model=source.d_model,
-        n_byte_values=256 + len(specials),
-        subword_vocab_size=resolution.vocab_size,
-        local_encoder=LocalContextEncoder(
-            source.d_model, n_layers=1, ffn_hidden=1024, n_heads=source.n_attention_heads, window=128
-        ),
-        boundary_predictor="mlp",
-    ).to(device)
-
     if args.init and Path(args.init).exists():
-        ckpt = torch.load(args.init, map_location=device, weights_only=False)
-        encoder.load_state_dict(ckpt["encoder"], strict=False)
+        # The architecture comes out of the checkpoint, not out of constants here.
+        encoder = load_byteified_encoder(args.init, source, tokenizer).to(device)
         print(f"initialised from {args.init}")
     else:
+        from byteify.source import build_byteified_encoder
+
+        encoder = build_byteified_encoder(source, tokenizer).to(device)
         encoder.embed.load_suffix_from(source.embedding_matrix())
         print("no --init given; suffix table initialised from the source embeddings")
 

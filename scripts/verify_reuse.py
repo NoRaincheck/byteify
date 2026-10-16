@@ -18,9 +18,12 @@ import gc
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-from byteify.alignment import align_text, discover_special_bytes
-from byteify.model import ByteifiedEncoder, LocalContextEncoder
-from byteify.source import HuggingFaceSourceEncoder
+from byteify.alignment import align_text
+from byteify.source import (
+    HuggingFaceSourceEncoder,
+    LocalEncoderSpec,
+    build_byteified_encoder,
+)
 from byteify.stitching import encode_texts
 from byteify.vocab import build_suffix_trie, resolve_token_bytes
 
@@ -92,21 +95,14 @@ def check(model_id: str, device: str) -> dict[str, object]:
     assert batch.byte_ids.shape[0] == 4
 
     # Forward pass through the byteified model and into the frozen source model.
-    encoder = ByteifiedEncoder(
-        d_model=source.d_model,
-        n_byte_values=256 + len(specials),
-        subword_vocab_size=resolution.vocab_size,
-        local_encoder=LocalContextEncoder(
-            source.d_model,
-            n_layers=1,
+    encoder = build_byteified_encoder(
+        source,
+        tokenizer,
+        LocalEncoderSpec(
+            layers=1,
             ffn_hidden=256,
-            n_heads=source.n_attention_heads,
             window=32,
         ),
-        boundary_predictor="mlp",
-        local_decoder_layers=1,
-        local_decoder_ffn_hidden=256,
-        n_heads=source.n_attention_heads,
     ).to(device)
     with torch.no_grad():
         out = encoder(

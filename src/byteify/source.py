@@ -23,7 +23,9 @@ should route through :class:`HuggingFaceSourceEncoder`.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 from torch import Tensor, nn
@@ -294,3 +296,97 @@ def build_local_encoder(cfg: ByteifyConfig, source: SourceEncoder) -> nn.Module:
         window=cfg.local_window,
         backend=cfg.local_backend,
     )
+
+
+@dataclass(frozen=True)
+class LocalEncoderSpec:
+    """The byte interface's own architecture, as data rather than as a call-site constant.
+
+    These are the settings a caller chooses; everything else about a byteified encoder is
+    derived from the source model. They are recorded in a checkpoint and read back, so a
+    checkpoint trained with anything other than the defaults can still be loaded: building
+    the interface from defaults instead produced a different shape and failed the load.
+    """
+
+    layers: int = 1
+    backend: str = "attention"
+    window: int = 128
+    ffn_hidden: int = 1024
+    boundary_predictor: str = "mlp"
+    heads: int | None = None
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> LocalEncoderSpec:
+        """Read the spec out of a checkpoint's recorded configuration.
+
+        Reads the same key names the trainers write, so existing checkpoints load.
+        """
+        return cls(
+            layers=int(config.get("local_layers", 1)),
+            backend=str(config.get("local_backend", "attention")),
+            window=int(config.get("local_window", 128)),
+            ffn_hidden=int(config.get("local_ffn", 1024)),
+            boundary_predictor=str(config.get("boundary_predictor", "mlp")),
+        )
+
+    def to_config(self) -> dict[str, Any]:
+        return {
+            "local_layers": self.layers,
+            "local_backend": self.backend,
+            "local_window": self.window,
+            "local_ffn": self.ffn_hidden,
+            "boundary_predictor": self.boundary_predictor,
+        }
+
+
+def build_byteified_encoder(source: SourceEncoder, tokenizer, spec: LocalEncoderSpec | None = None):
+    """Reconstruct a byteified encoder from a source model and its tokenizer.
+
+    The single reconstruction path. The byte axis comes from the tokenizer's special
+    tokens, the subword vocabulary from its resolved byte strings, and the local encoder
+    from the spec -- so nothing about the interface is repeated at a call site.
+    """
+    from .alignment import discover_special_bytes
+    from .model import ByteifiedEncoder, LocalContextEncoder
+    from .vocab import resolve_token_bytes
+
+    spec = spec or LocalEncoderSpec()
+    resolution = resolve_token_bytes(tokenizer)
+    specials = discover_special_bytes(tokenizer)
+    heads = spec.heads or getattr(source, "n_attention_heads", 8)
+
+    return ByteifiedEncoder(
+        d_model=source.d_model,
+        n_byte_values=256 + len(specials),
+        subword_vocab_size=resolution.vocab_size,
+        local_encoder=LocalContextEncoder(
+            source.d_model,
+            n_layers=spec.layers,
+            ffn_hidden=spec.ffn_hidden,
+            n_heads=heads,
+            window=spec.window,
+            backend=spec.backend,
+        ),
+        boundary_predictor=spec.boundary_predictor,
+    )
+
+
+def load_byteified_encoder(path, source: SourceEncoder, tokenizer):
+    """Load a byteified encoder from a checkpoint, taking its architecture from the file.
+
+    Returns the encoder. Raises if the checkpoint's recorded architecture disagrees with
+    the weights, rather than silently loading a subset.
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    recorded = checkpoint.get("config") or checkpoint.get("args") or {}
+    encoder = build_byteified_encoder(source, tokenizer, LocalEncoderSpec.from_config(recorded))
+
+    # strict=False tolerates keys the encoder does not have, but a shape disagreement is
+    # still an error -- which is the point: it must not load a different architecture's
+    # weights into this one.
+    _, unexpected = encoder.load_state_dict(checkpoint["encoder"], strict=False)
+    if unexpected:
+        raise ValueError(
+            f"checkpoint holds weights the encoder has no use for: {sorted(unexpected)}"
+        )
+    return encoder
