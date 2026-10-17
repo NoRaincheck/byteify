@@ -32,6 +32,10 @@ from .gates import (
 from .levels import declare, resolve_level
 from .manifest import Manifest, export_artifact, measure_trie_coverage
 
+#: Bolmo's compression ratio on English prose. Used to fit a patch budget to a byte axis;
+#: see `_fit_patch_budget`.
+TARGET_BYTES_PER_PATCH = 4.0
+
 
 def build_artifact(
     *,
@@ -42,7 +46,7 @@ def build_artifact(
     steps: int = 2000,
     batch_size: int = 4,
     max_bytes: int = 512,
-    patch_budget: int = 64,
+    patch_budget: int | None = None,
     local_layers: int = 1,
     local_ffn: int = 1024,
     local_window: int = 128,
@@ -101,6 +105,7 @@ def build_artifact(
     say(f"  thresholds  cos_emb_c >= {thresholds.cos_emb_c}, "
         f"sim_corr >= {thresholds.sim_corr}, boundary_acc >= {thresholds.boundary_acc}")
     say(f"  reference   {len(texts)} texts from {', '.join(data)}")
+    patch_budget = _fit_patch_budget(patch_budget, max_bytes=max_bytes, say=say)
 
     estimate = steps * 0.12  # measured on the 16.8M anchor on MPS
     say()
@@ -124,7 +129,7 @@ def build_artifact(
         # A previous failed run may have left files; a previous *successful* one should be
         # raised explicitly, because silently replacing a good artifact is worse than
         # refusing.
-        if (output_dir / "manifest.json").exists() and not _resumable(output_dir):
+        if (output_dir / "manifest.json").exists():
             raise FileExistsError(
                 f"{output_dir} already holds an artifact. Pass a different --out, or "
                 "remove it. byteify does not overwrite an artifact it cannot verify."
@@ -279,6 +284,41 @@ def _tables(tokenizer):
     from .stitching import tokenizer_tables
 
     return tokenizer_tables(tokenizer)
+
+
+def _fit_patch_budget(
+    patch_budget: int | None, *, max_bytes: int, say
+) -> int:
+    """Choose a patch budget matched to the byte axis, or warn that it is not.
+
+    The patch budget and the byte axis are not independent. Bolmo's compression ratio is
+    about 4.3 bytes per patch on English prose, so a 512-byte axis needs roughly 120
+    patches; a budget of 64 forces the extra patches to merge and measurably costs
+    fidelity -- on the anchor model, centred cosine 0.585 at budget 64 against 0.795 at
+    budget 128 for the same checkpoint. Going the other way wastes compute on masked slots,
+    and is also measured (0.762 at budget 256).
+
+    So a default of "64" was simply wrong for any axis above about 256 bytes. The budget
+    now follows the axis and the data, and a user who set one that does not fit is told.
+    """
+    if patch_budget is None:
+        chosen = max(8, round(max_bytes / TARGET_BYTES_PER_PATCH))
+        say(f"  patch budget {chosen} (derived from a {max_bytes}-byte axis at "
+            f"{TARGET_BYTES_PER_PATCH} bytes/patch)")
+        return chosen
+
+    implied = patch_budget * TARGET_BYTES_PER_PATCH
+    if implied < max_bytes * 0.6:
+        say()
+        say(
+            f"  warning: a patch budget of {patch_budget} on a {max_bytes}-byte axis implies "
+            f"{implied / max_bytes:.1f} bytes per patch, against a tokenizer ratio of about "
+            f"{TARGET_BYTES_PER_PATCH}. The surplus will merge into fewer patches, and the "
+            f"embedding is being computed at a budget you did not intend. Either raise "
+            f"--patch-budget to about {max(8, round(max_bytes / TARGET_BYTES_PER_PATCH))} or "
+            f"lower --max-bytes."
+        )
+    return patch_budget
 
 
 def _example_inputs(embedder, rule, trie, texts: list[str], width: int):

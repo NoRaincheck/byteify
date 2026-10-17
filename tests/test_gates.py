@@ -339,6 +339,47 @@ def test_a_failed_gate_leaves_the_output_directory_empty(tmp_path: Path):
 # -- the manifest refuses an artifact whose gate failed -------------------
 
 
+# -- the patch budget has to fit the byte axis ----------------------------
+
+
+def test_the_patch_budget_defaults_to_the_byte_axis():
+    """A fixed default of "64" was wrong for any axis above about 256 bytes.
+
+    Bolmo's ratio is about 4 bytes per patch, so a 512-byte axis needs ~128. Measured on
+    the anchor: centred cosine 0.585 at budget 64 against 0.795 at 128, same checkpoint.
+    """
+    from byteify.build import TARGET_BYTES_PER_PATCH, _fit_patch_budget
+
+    lines: list[str] = []
+    budget = _fit_patch_budget(None, max_bytes=512, say=lambda m="": lines.append(m))
+    assert budget == round(512 / TARGET_BYTES_PER_PATCH)
+    assert any("derived" in line for line in lines)
+
+    assert _fit_patch_budget(None, max_bytes=256, say=lambda m="": lines.append(m)) == 64
+    assert _fit_patch_budget(None, max_bytes=128, say=lambda m="": lines.append(m)) == 32
+
+
+def test_a_mismatched_patch_budget_is_warned_about():
+    """Too few patches merges them and costs fidelity; the user should be told."""
+    from byteify.build import _fit_patch_budget
+
+    lines: list[str] = []
+    chosen = _fit_patch_budget(64, max_bytes=512, say=lambda m="": lines.append(m))
+    assert chosen == 64, "the user's explicit budget must be honoured"
+    assert any("warning" in line and "patch budget" in line for line in lines), lines
+
+
+def test_a_sensible_patch_budget_is_not_warned_about():
+    from byteify.build import _fit_patch_budget
+
+    lines: list[str] = []
+    _fit_patch_budget(128, max_bytes=512, say=lambda m="": lines.append(m))
+    assert not any("warning" in line for line in lines), lines
+
+
+# -- a manifest refuses an artifact whose gate failed -------------------
+
+
 def test_a_manifest_recording_a_failed_gate_is_refused(valid_manifest):
     from dataclasses import replace
 

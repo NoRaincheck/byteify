@@ -258,8 +258,9 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--batch-size", type=int, default=4)
     build.add_argument("--max-bytes", type=int, default=512,
                        help="fixed byte axis; longer inputs fail rather than truncate")
-    build.add_argument("--patch-budget", type=int, default=64,
-                       help="fixed patch axis; masks low-confidence slots")
+    build.add_argument("--patch-budget", type=int, default=None,
+                       help="fixed patch axis (default: fitted to --max-bytes). Surplus "
+                            "slots are masked; too few merges patches and costs fidelity")
     build.add_argument("--local-layers", type=int, default=1)
     build.add_argument("--local-ffn", type=int, default=1024)
     build.add_argument("--local-window", type=int, default=128)
