@@ -13,6 +13,9 @@ dependencies = [
     "numpy>=1.26",
 ]
 
+[project.scripts]
+byteify = "byteify.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
@@ -39,3 +42,6 @@ line-length = 100
 [tool.uv.build-backend]
 module-name = "byteify"
 module-root = "src"
+# Gate thresholds ship with the package: they are data, but the tool cannot refuse a
+# source model it has no published floors for without them.
+source-include = ["src/byteify/assets/*.json"]

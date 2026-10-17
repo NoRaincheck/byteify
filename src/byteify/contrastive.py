@@ -175,6 +175,107 @@ def pair_batches(
         yield order[i : i + batch_size]
 
 
+def train_contrastive_on_corpus(
+    encoder,
+    source,
+    tokenizer,
+    texts: Sequence[str],
+    *,
+    steps: int = 500,
+    batch_size: int = 8,
+    lr: float = 1e-4,
+    temperature: float = 0.05,
+    max_bytes: int = 512,
+    seed: int = 0,
+    device: str = "cpu",
+    log=lambda message: None,
+) -> dict:
+    """Fit the byte interface to the similarity structure of a corpus.
+
+    This is the objective Stage 1 and Stage 2 do not optimise. Stage 1 imitates a source
+    model that was never trained on the practitioner's domain; this fits the domain, which
+    is what level 2 is for.
+
+    Positives are mined in the *source* model's space, so the pairs reflect real semantic
+    similarity rather than whatever the byte interface currently believes. Returns the
+    encoder's new state dict.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    from .data import truncate_to_bytes
+    from .fidelity import _budgeted_patch_reps, pool_final
+    from .inference import ByteifiedEmbedder
+    from .stitching import encode_texts
+
+    if len(texts) < 8:
+        raise ValueError(f"contrastive training needs at least 8 texts; got {len(texts)}")
+
+    torch.manual_seed(seed)
+    encoder.to(device).train()
+    embedder = ByteifiedEmbedder(encoder, source, n_patches=min(64, max_bytes)).to(device)
+
+    def source_embeddings(batch_texts: list[str]) -> torch.Tensor:
+        rows = encode_texts(
+            [truncate_to_bytes(t, max_bytes) for t in batch_texts],
+            tokenizer,
+            add_special_tokens=True,
+            device=device,
+        )
+        with torch.no_grad():
+            return pool_final(
+                source.representation_at(rows.input_ids, rows.attention_mask, source.n_layers),
+                rows.attention_mask.bool(),
+                source.final_norm,
+            )
+
+    pairs = mine_pairs(
+        texts,
+        source_embeddings,
+        pool_size=min(128, len(texts)),
+        n_per_anchor=1,
+        temperature=temperature,
+        seed=seed,
+    )
+    if not pairs:
+        raise ValueError("no positive pairs could be mined from the reference corpus")
+    log(f"  mined {len(pairs)} positive pairs from {len(texts)} texts")
+
+    head = ContrastiveHead(encoder.embed.byte.weight.shape[1]).to(device)
+    params = list(encoder.parameters()) + list(head.parameters())
+    opt = torch.optim.AdamW(params, lr=lr)
+
+    def embed(batch_rows) -> torch.Tensor:
+        reps, mask, _ = _budgeted_patch_reps(embedder, batch_rows)
+        hidden = source.forward_layers(reps, mask, n_layers=source.n_layers)
+        return F.normalize(pool_final(hidden, mask, source.final_norm), dim=-1)
+
+    for done, batch in enumerate(pair_batches(pairs, batch_size, seed=seed), start=1):
+        if done > steps:
+            break
+        rows = encode_texts(
+            [truncate_to_bytes(t, max_bytes) for pair in batch for t in pair],
+            tokenizer,
+            add_special_tokens=True,
+            device=device,
+        )
+        half = len(batch)
+        loss = infonce(
+            head(embed(rows[:half])), head(embed(rows[half:])),
+            temperature=temperature,
+        )
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
+
+        if done % max(1, steps // 10) == 0:
+            log(f"  step {done:>6}  infonce {loss.item():.4f}")
+
+    encoder.eval()
+    return encoder.state_dict()
+
+
 def retrieval_metrics(
     query_embeddings: Tensor,
     doc_embeddings: Tensor,

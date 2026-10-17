@@ -156,6 +156,39 @@ def test_local_encoder_respects_padding():
     assert torch.allclose(a[:, :6], b[:, :6], atol=1e-5), "padding leaked into real positions"
 
 
+def test_padded_positions_do_not_produce_nan():
+    """A padded query position has no permitted keys, and its output must be finite.
+
+    Regression: the band mask was intersected with the key-padding mask, so a query position
+    that was itself padding ended up with an all-``-inf`` row. softmax over that row is NaN,
+    and the NaN flowed through the residual stream into every parameter's gradient. Stage 1
+    produced NaN losses within a dozen steps, and it surfaced as a fidelity metric that was
+    quietly not a number rather than as a crash.
+    """
+    torch.manual_seed(0)
+    enc = LocalContextEncoder(16, n_layers=1, ffn_hidden=32, n_heads=4, window=8)
+    x = torch.randn(1, 12, 16, requires_grad=True)
+    mask = torch.ones(1, 12, dtype=torch.long)
+    mask[:, 4:] = 0
+
+    out = enc(x, mask)
+    assert torch.isfinite(out).all(), "a padded position produced a non-finite value"
+
+    out.sum().backward()
+    assert torch.isfinite(x.grad).all(), "input gradient is non-finite"
+    for name, parameter in enc.named_parameters():
+        if parameter.grad is not None:
+            assert torch.isfinite(parameter.grad).all(), f"{name} got a non-finite gradient"
+
+
+def test_a_fully_padded_row_is_finite():
+    """A row that is entirely padding is the degenerate case of the same defect."""
+    torch.manual_seed(0)
+    enc = LocalContextEncoder(16, n_layers=1, ffn_hidden=32, n_heads=4, window=8)
+    out = enc(torch.randn(1, 4, 16), torch.zeros(1, 4, dtype=torch.long))
+    assert torch.isfinite(out).all()
+
+
 def test_local_encoder_gru_backend():
     enc = LocalContextEncoder(16, n_layers=1, backend="gru")
     out = enc(torch.randn(2, 10, 16), torch.ones(2, 10, dtype=torch.long))

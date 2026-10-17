@@ -78,3 +78,45 @@ def tiny_tokenizer(tiny_tokenizers):
 def tiny_source_tokenizer(tiny_tokenizers):
     """The tokenizer the synthetic source model was built alongside."""
     return tiny_tokenizers[SYNTHETIC_MODEL_TOKENIZER["modernbert"]]
+
+
+@pytest.fixture()
+def valid_manifest():
+    """A minimal manifest that passes validation.
+
+    Shared rather than per-module, because "is this manifest loadable?" is one question and
+    two copies of the answer would drift.
+    """
+    from byteify import Manifest
+
+    return Manifest(
+        architecture="ettin-encoder-17m",
+        budget=64,
+        max_bytes=512,
+        source_id="jhu-clsp/ettin-encoder-17m",
+        source_revision="abc123",
+        family="bytelevel",
+        byte_stream_rule="nfc",
+        vocab_size=50368,
+        n_byte_values=263,
+        encoder_arch={
+            "layers": 1,
+            "backend": "attention",
+            "window": 128,
+            "ffn_hidden": 1024,
+            "boundary_predictor": "mlp",
+        },
+        source_d_model=256,
+        source_n_layers=7,
+        byte_stream={
+            "rule": "nfc",
+            "family": "bytelevel",
+            "n_byte_values": 263,
+            "open_pseudo": 256,
+            "close_pseudo": 257,
+            "pseudo_bytes": {"256": 0, "257": 1},
+        },
+        seed=42,
+        versions={"python": "3.12"},
+        exported_at="2026-01-01T00:00:00",
+    )

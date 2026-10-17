@@ -8,7 +8,15 @@ Bolmo's method has no encoder counterpart upstream: `allenai/bolmo-core` is
 decoder-only throughout (it mandates an LM head, its local decoder exists only for
 next-byte prediction, and `olmo-core` has no ModernBERT). This package reuses the
 *algorithm* and rebuilds the parts that are encoder-specific.
+
+The product is the **byte-native serving artifact**: a fixed-shape ONNX graph, deployable
+without a source tokenizer, described by a manifest that is its only entry point. Fidelity
+to the source model is a constraint the tool preserves and verifies (ADR 0007), because
+fidelity is what this repository's measurements support and "byteified models are better"
+is not established anywhere in it.
 """
+
+__version__ = "0.2.0"
 
 from .alignment import (
     SPECIAL_TOKENS,

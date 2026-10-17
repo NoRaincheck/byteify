@@ -29,6 +29,15 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+#: The score given to a masked-out key. Not ``-inf``: an all-``-inf`` row softmaxes to NaN,
+#: and a padded query position is exactly such a row. ``finfo.min`` is finite, so the
+#: softmax returns a finite (uniform) distribution that the caller then discards.
+_MASKED_SCORE = {
+    torch.float32: torch.finfo(torch.float32).min,
+    torch.float16: torch.finfo(torch.float16).min,
+    torch.bfloat16: torch.finfo(torch.bfloat16).min,
+}
+
 # Upper bound on the dense band mask built by ``LocalAttention`` (elements, not bytes).
 # 2**28 elements is ~2 GB as bool and stays inside MPS's 32-bit indexing limit at the
 # batch sizes this project uses.
@@ -181,11 +190,18 @@ class LocalAttention(nn.Module):
             mask = mask & attention_mask[:, None, None, :].bool()
 
         bias = torch.zeros(mask.shape, dtype=q.dtype, device=q.device).masked_fill(
-            ~mask, float("-inf")
+            ~mask, _MASKED_SCORE[q.dtype]
         )
         scores = (q @ k.transpose(-1, -2)) / math.sqrt(self.head_dim) + bias
         weights = torch.softmax(scores, dim=-1)
         out = weights @ v
+        # A query position that is itself padding has no permitted keys at all -- every key
+        # at or before it is padding too. softmax over an all-masked row is undefined and
+        # returns NaN, which then propagates through the residual stream into every
+        # parameter's gradient. Zero those rows instead: their output is discarded anyway,
+        # and a NaN that only nobody reads is still a NaN that trains.
+        query_valid = mask.any(dim=-1, keepdim=True)
+        out = out * query_valid.to(out.dtype)
         # [B, heads, N, head_dim] -> [B, N, d_model]. permute then reshape, mirroring
         # the split above. (flatten(1, 2) is not a substitute: it merges heads into the
         # sequence axis and silently yields [B, N * heads, head_dim].)
