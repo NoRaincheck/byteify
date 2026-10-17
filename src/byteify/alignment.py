@@ -149,6 +149,7 @@ def align_from_offsets(
     boundaries: list[int] = []
     n_absorbed = 0
     cursor = 0  # next unassigned byte
+    last_real_token: int | None = None  # index into `lengths` of the last content token
 
     for i, (start, end) in enumerate(offsets):
         # Special tokens always get a pseudo-byte, regardless of offset.  Some
@@ -207,15 +208,29 @@ def align_from_offsets(
         boundaries[-1] = 1
         n_absorbed += char_start_b - start_byte
         cursor = end_byte
+        last_real_token = len(lengths) - 1
 
-    # Trailing gap belongs to the last real token.
+    # Trailing gap: bytes no token covered.  They join the last content token, and they
+    # are inserted *before* any trailing pseudo-byte.  Appending them after the separator
+    # put [SEP] in the middle of the stream, which silently broke the bracketing the model
+    # was trained with: the byte that terminates the sequence stopped terminating it.
     if cursor < len(data) and lengths:
         tail = data[cursor:]
-        byte_ids.extend(tail)
-        boundaries[-1] = 0
-        boundaries.extend([0] * len(tail))
-        boundaries[-1] = 1
-        lengths[-1] += len(tail)
+        insert_at = len(byte_ids)
+        while insert_at > 0 and byte_ids[insert_at - 1] >= 256:
+            insert_at -= 1
+
+        byte_ids[insert_at:insert_at] = list(tail)
+        boundaries[insert_at:insert_at] = [0] * len(tail)
+        boundaries[insert_at + len(tail) - 1] = 1
+        if insert_at > 0:
+            # The byte the tail continues is no longer that token's last byte.
+            boundaries[insert_at - 1] = 0
+
+        if last_real_token is None:
+            lengths.append(len(tail))
+        else:
+            lengths[last_real_token] += len(tail)
         n_absorbed += len(tail)
 
     if len(boundaries) != len(byte_ids) or sum(lengths) != len(byte_ids):
@@ -230,6 +245,21 @@ def align_from_offsets(
         boundaries=tuple(boundaries),
         covered=n_absorbed,
     )
+
+
+def bracket_pseudo_bytes(special_token_ids: Mapping[int, int]) -> dict[int, int]:
+    """The pseudo-bytes that bracket the stream, and only those.
+
+    ``discover_special_bytes`` also maps ``[UNK]`` and any added special token, and those
+    must **not** be emitted into the byte stream. An unknown token stands for a character
+    the vocabulary cannot represent; emitting a pseudo-byte for it injects a value that is
+    not a byte of the text, so the training stream and the text disagree at exactly the
+    positions the tokenizer struggled with. The pseudo-byte values stay reserved -- the
+    byte table's size does not change and old checkpoints still load -- but only the class
+    and separator pseudo-bytes are ever emitted (ADR 0011).
+    """
+    ordered = list(special_token_ids.items())[:2]
+    return dict(ordered)
 
 
 def align_text(
@@ -265,6 +295,9 @@ def align_text(
     if special_token_ids is None:
         special_token_ids = discover_special_bytes(tokenizer)
 
+    # Only the bracketing pseudo-bytes are emitted. See `bracket_pseudo_bytes`.
+    emitted = bracket_pseudo_bytes(special_token_ids)
+
     if strategy == "bytelevel":
         from .vocab import resolve_token_bytes
 
@@ -272,8 +305,8 @@ def align_text(
         token_ids = tokenizer(text, add_special_tokens=add_special_tokens)["input_ids"]
         parts: list[bytes | int] = []
         for token_id in token_ids:
-            if token_id in special_token_ids:
-                parts.append(special_token_ids[token_id])
+            if token_id in emitted:
+                parts.append(emitted[token_id])
             else:
                 parts.append(resolution.token_bytes[token_id])
         return align(token_ids, parts)
@@ -290,7 +323,7 @@ def align_text(
     )
     return align_from_offsets(
         normalised_text, encoded["input_ids"], encoded["offset_mapping"],
-        special_token_ids=special_token_ids,
+        special_token_ids=emitted,
     )
 
 

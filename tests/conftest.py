@@ -54,12 +54,18 @@ def tiny_source(tiny_source_dir):
 
 @pytest.fixture(scope="session")
 def tiny_source_encoder(tiny_source):
-    """The synthetic model wrapped in the source-model interface."""
+    """The synthetic model wrapped in the source-model interface.
+
+    Carries its directory as ``model_id``, because a manifest records the source id and
+    refuses to describe an artifact whose source it cannot name.
+    """
     from transformers import AutoModel
 
     from byteify.source import HuggingFaceSourceEncoder
 
-    return HuggingFaceSourceEncoder(AutoModel.from_pretrained(tiny_source)).eval()
+    return HuggingFaceSourceEncoder(
+        AutoModel.from_pretrained(tiny_source), model_id=str(tiny_source)
+    ).eval()
 
 
 @pytest.fixture(scope="session")

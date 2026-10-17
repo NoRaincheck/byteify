@@ -53,9 +53,12 @@ class SourceEncoder(nn.Module):
 class HuggingFaceSourceEncoder(SourceEncoder):
     """Works for ModernBERT and BERT-family encoders alike."""
 
-    def __init__(self, model: nn.Module) -> None:
+    def __init__(self, model: nn.Module, model_id: str = "") -> None:
         super().__init__()
         self.model = model
+        # Recorded so a manifest built from this encoder can name what it byteified.
+        # Empty when the caller loaded the weights some other way.
+        self.model_id = model_id
         cfg = model.config
         self.d_model = int(cfg.hidden_size)
         self.vocab_size = int(cfg.vocab_size)
@@ -235,14 +238,34 @@ class ByteifiedSourceEncoder(SourceEncoder):
 
 
 def resolve_source_encoder(model_or_name) -> HuggingFaceSourceEncoder:
-    """Load a model by id (or wrap an already-loaded one) as a SourceEncoder."""
+    """Load a model by id (or wrap an already-loaded one) as a SourceEncoder.
+
+    Accepts a clear error rather than a traceback for a model this repository cannot
+    byteify, naming what is accepted.
+    """
     if isinstance(model_or_name, str):
         from transformers import AutoModel
 
-        model = AutoModel.from_pretrained(model_or_name)
+        model_id = model_or_name
+        try:
+            model = AutoModel.from_pretrained(model_id)
+        except OSError as exc:
+            raise FileNotFoundError(
+                f"could not load {model_id}: {exc}\n"
+                "If it is not in the local HuggingFace cache, download it first "
+                "(unset HF_HUB_OFFLINE). A local directory path also works."
+            ) from exc
     else:
         model = model_or_name
-    return HuggingFaceSourceEncoder(model)
+        model_id = getattr(model_or_name, "name_or_path", "") or ""
+    try:
+        return HuggingFaceSourceEncoder(model, model_id=model_id)
+    except TypeError as exc:
+        raise TypeError(
+            f"{model_id or type(model).__name__} is not a byteify source model. Accepted "
+            "architectures: ModernBERT (`embeddings` + `layers`) and the BERT family "
+            f"(`embeddings` + `encoder.layer`). Original error: {exc}"
+        ) from exc
 
 
 @dataclass
@@ -325,23 +348,46 @@ class LocalEncoderSpec:
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> LocalEncoderSpec:
-        """Read the spec out of a checkpoint's recorded configuration.
+        """Read a spec from either a checkpoint's config or a manifest's ``encoder_arch``.
 
-        Reads the same key names the trainers write, so existing checkpoints load. Stage 1
-        checkpoints predate the output side and carry no ``out_layers``; they default to 0,
-        which is what those checkpoints were actually trained with.
+        Checkpoints store the flags under their ``local_*`` names; a manifest stores the
+        spec's own field names. Reading both means a loader can be handed either without
+        a translation step that could silently drop a field.
         """
+        def pick(*names: str, default: Any) -> Any:
+            for name in names:
+                if name in config:
+                    return config[name]
+            return default
+
         return cls(
-            layers=int(config.get("local_layers", 1)),
-            backend=str(config.get("local_backend", "attention")),
-            window=int(config.get("local_window", 128)),
-            ffn_hidden=int(config.get("local_ffn", 1024)),
-            boundary_predictor=str(config.get("boundary_predictor", "mlp")),
-            out_layers=int(config.get("out_layers", 0)),
-            out_ffn_hidden=int(config.get("out_ffn", 1024)),
+            layers=int(pick("layers", "local_layers", default=1)),
+            backend=str(pick("backend", "local_backend", default="attention")),
+            window=int(pick("window", "local_window", default=128)),
+            ffn_hidden=int(pick("ffn_hidden", "local_ffn", default=1024)),
+            boundary_predictor=str(pick("boundary_predictor", default="mlp")),
+            out_layers=int(pick("out_layers", default=0)),
+            out_ffn_hidden=int(pick("out_ffn_hidden", "out_ffn", default=1024)),
         )
 
+    def as_dict(self) -> dict[str, Any]:
+        """The spec under its own field names, for a manifest.
+
+        A manifest is a contract read by something that does not know how a checkpoint
+        happened to be written, so it carries the spec's names rather than the trainer's.
+        """
+        return {
+            "layers": self.layers,
+            "backend": self.backend,
+            "window": self.window,
+            "ffn_hidden": self.ffn_hidden,
+            "boundary_predictor": self.boundary_predictor,
+            "out_layers": self.out_layers,
+            "out_ffn_hidden": self.out_ffn_hidden,
+        }
+
     def to_config(self) -> dict[str, Any]:
+        """The spec under the trainers' ``local_*`` names, for a checkpoint."""
         return {
             "local_layers": self.layers,
             "local_backend": self.backend,
@@ -353,31 +399,33 @@ class LocalEncoderSpec:
         }
 
 
-def build_byteified_encoder(source: SourceEncoder, tokenizer, spec: LocalEncoderSpec | None = None):
-    """Reconstruct a byteified encoder from a source model and its tokenizer.
+def build_encoder_from_dimensions(
+    *,
+    d_model: int,
+    n_byte_values: int,
+    subword_vocab_size: int,
+    spec: LocalEncoderSpec | None = None,
+    n_heads: int = 8,
+):
+    """Build a byteified encoder from resolved numbers.
 
-    The single reconstruction path. The byte axis comes from the tokenizer's special
-    tokens, the subword vocabulary from its resolved byte strings, and the local encoder
-    from the spec -- so nothing about the interface is repeated at a call site.
+    The one place an encoder is constructed. Both routes into it -- a source model plus
+    its tokenizer, and a manifest -- resolve their numbers and come through here, so the
+    two cannot build different architectures out of the same facts.
     """
-    from .alignment import discover_special_bytes
     from .model import ByteifiedEncoder, LocalContextEncoder
-    from .vocab import resolve_token_bytes
 
     spec = spec or LocalEncoderSpec()
-    resolution = resolve_token_bytes(tokenizer)
-    specials = discover_special_bytes(tokenizer)
-    heads = spec.heads or getattr(source, "n_attention_heads", 8)
 
     return ByteifiedEncoder(
-        d_model=source.d_model,
-        n_byte_values=256 + len(specials),
-        subword_vocab_size=resolution.vocab_size,
+        d_model=d_model,
+        n_byte_values=n_byte_values,
+        subword_vocab_size=subword_vocab_size,
         local_encoder=LocalContextEncoder(
-            source.d_model,
+            d_model,
             n_layers=spec.layers,
             ffn_hidden=spec.ffn_hidden,
-            n_heads=heads,
+            n_heads=n_heads,
             window=spec.window,
             backend=spec.backend,
         ),
@@ -385,27 +433,54 @@ def build_byteified_encoder(source: SourceEncoder, tokenizer, spec: LocalEncoder
         local_decoder_layers=spec.out_layers,
         local_decoder_ffn_hidden=spec.out_ffn_hidden,
         local_decoder_window=spec.window,
-        n_heads=heads,
+        n_heads=n_heads,
         backend=spec.backend,
     )
 
 
-def load_byteified_encoder(path, source: SourceEncoder, tokenizer):
-    """Load a byteified encoder from a checkpoint, taking its architecture from the file.
+def build_byteified_encoder(source: SourceEncoder, tokenizer, spec: LocalEncoderSpec | None = None):
+    """Reconstruct a byteified encoder from a source model and its tokenizer.
 
-    Returns the encoder. Raises if the checkpoint's recorded architecture disagrees with
-    the weights, rather than silently loading a subset.
+    A convenience over :func:`build_encoder_from_dimensions`: it resolves the tokenizer's
+    special tokens and vocabulary for you. Nothing about the interface is repeated here.
     """
+    from .alignment import discover_special_bytes
+    from .vocab import resolve_token_bytes
+
+    spec = spec or LocalEncoderSpec()
+    resolution = resolve_token_bytes(tokenizer)
+    specials = discover_special_bytes(tokenizer)
+    heads = spec.heads or getattr(source, "n_attention_heads", 8)
+
+    return build_encoder_from_dimensions(
+        d_model=source.d_model,
+        n_byte_values=256 + len(specials),
+        subword_vocab_size=resolution.vocab_size,
+        spec=spec,
+        n_heads=heads,
+    )
+
+
+def load_encoder_state(encoder: nn.Module, state: dict[str, Tensor], *, source: str = "checkpoint"):
+    """Load encoder weights, refusing a silent partial load.
+
+    ``strict=False`` is needed because a Stage 2 encoder can carry an output side a Stage 1
+    encoder has no use for. But a shape disagreement is still an error: that is the point.
+    A checkpoint holding weights this encoder cannot accept means the two disagree about
+    their architecture, and loading the overlap would hide that.
+    """
+    missing, unexpected = encoder.load_state_dict(state, strict=False)
+    if unexpected:
+        raise ValueError(
+            f"{source} holds weights the encoder has no use for: {sorted(unexpected)}"
+        )
+    return missing
+
+
+def load_byteified_encoder(path, source: SourceEncoder, tokenizer):
+    """Load a byteified encoder from a checkpoint, taking its architecture from the file."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     recorded = checkpoint.get("config") or checkpoint.get("args") or {}
     encoder = build_byteified_encoder(source, tokenizer, LocalEncoderSpec.from_config(recorded))
-
-    # strict=False tolerates keys the encoder does not have, but a shape disagreement is
-    # still an error -- which is the point: it must not load a different architecture's
-    # weights into this one.
-    _, unexpected = encoder.load_state_dict(checkpoint["encoder"], strict=False)
-    if unexpected:
-        raise ValueError(
-            f"checkpoint holds weights the encoder has no use for: {sorted(unexpected)}"
-        )
+    load_encoder_state(encoder, checkpoint["encoder"], source=str(path))
     return encoder

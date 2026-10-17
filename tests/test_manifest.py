@@ -1,45 +1,47 @@
-"""Tests for the manifest module (Ticket #13).
+"""The manifest is a byteified artifact's only entry point (Ticket #13).
 
-The manifest is a byteified artifact's only entry point.  Every field is
-validated, and the round-trip through JSON must preserve every value.
+The bar for these tests is what a user of the artifact can observe: a manifest field, a
+refusal, an embedding. The one that matters most is the round trip -- save an artifact,
+load it through its manifest alone with nothing else supplied, and get the same embeddings
+back. An artifact that loads but computes something else is useless, and that is the class
+of defect this whole ticket exists to close.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 from pathlib import Path
 
 import pytest
 import torch
-from transformers import AutoTokenizer
 
-from byteify import GateResults, Manifest, from_checkpoint
+from byteify import ByteifiedEmbedder, Manifest, export_artifact, load_artifact
+from byteify.bytestream import rule_for_family
+from byteify.manifest import (
+    ManifestError,
+    UnsupportedSchemaVersion,
+    manifest_from_checkpoint,
+    read_trie,
+    write_trie,
+)
+from byteify.source import LocalEncoderSpec, build_byteified_encoder
+
+# -- fixtures ------------------------------------------------------------
 
 
 @pytest.fixture()
-def manifest():
-    """A minimal but valid manifest."""
+def valid_manifest() -> Manifest:
+    """A minimal manifest that passes validation."""
     return Manifest(
-        schema_version="1",
         architecture="ettin-encoder-17m",
         budget=64,
         max_bytes=512,
         source_id="jhu-clsp/ettin-encoder-17m",
         source_revision="abc123",
-        family="wordpiece",
-        byte_stream_rule="raw-utf8",
-        vocab_size=30522,
-        n_byte_values=260,
-        gate=GateResults(
-            cos_emb=0.92,
-            sim_corr=0.89,
-            boundary_acc=0.94,
-            nn_agree=0.82,
-            gate_passed=True,
-        ),
-        seed=42,
-        versions={"python": "3.12"},
+        family="bytelevel",
+        byte_stream_rule="nfc",
+        vocab_size=50368,
+        n_byte_values=263,
         encoder_arch={
             "layers": 1,
             "backend": "attention",
@@ -47,217 +49,407 @@ def manifest():
             "ffn_hidden": 1024,
             "boundary_predictor": "mlp",
         },
-        source_d_model=768,
-        source_n_layers=12,
+        source_d_model=256,
+        source_n_layers=7,
+        byte_stream={
+            "rule": "nfc",
+            "family": "bytelevel",
+            "n_byte_values": 263,
+            "open_pseudo": 256,
+            "close_pseudo": 257,
+            "pseudo_bytes": {"256": 0, "257": 1},
+        },
+        seed=42,
+        versions={"python": "3.12"},
         exported_at="2026-01-01T00:00:00",
     )
 
 
-def _round_trip(manifest: Manifest) -> Manifest:
-    """Serialize to JSON and deserialize back."""
-    text = manifest.to_json()
-    return Manifest.from_json(text)
+@pytest.fixture()
+def trained_encoder(tmp_path: Path, tiny_source_encoder, tiny_source_tokenizer):
+    """A byteified encoder with a checkpoint on disk, trained for a handful of steps.
 
-
-# -- round-trip ----------------------------------------------------------
-
-
-def test_round_trip_preserves_every_field(manifest):
-    rebuilt = _round_trip(manifest)
-    assert asdict(rebuilt) == asdict(manifest)
-
-
-def test_round_trip_preserves_gate(manifest):
-    rebuilt = _round_trip(manifest)
-    assert rebuilt.gate is not None
-    assert rebuilt.gate.cos_emb == manifest.gate.cos_emb
-    assert rebuilt.gate.sim_corr == manifest.gate.sim_corr
-    assert rebuilt.gate.gate_passed == manifest.gate.gate_passed
-
-
-def test_round_trip_with_no_gate(manifest):
-    no_gate_manifest = Manifest(**{
-        k: v for k, v in asdict(manifest).items() if k != "gate"
-    })
-    rebuilt = _round_trip(no_gate_manifest)
-    assert rebuilt.gate is None
-
-
-# -- file I/O -----------------------------------------------------------
-
-
-def test_write_to_and_read_back(manifest, tmp_path: Path):
-    out = tmp_path / "manifest.json"
-    manifest.write_to(out)
-    assert out.exists()
-    loaded = Manifest.from_file(out)
-    assert asdict(loaded) == asdict(manifest)
-
-
-def test_write_to_creates_parent(manifest, tmp_path: Path):
-    out = tmp_path / "sub" / "manifest.json"
-    manifest.write_to(out)
-    assert out.exists()
-
-
-# -- validation ---------------------------------------------------------
-
-
-def test_validate_passes_for_valid_manifest(manifest):
-    assert manifest.validate() == []
-
-
-def test_validate_rejects_empty_source_id(manifest):
-    bad = Manifest(
-        **{k: v for k, v in asdict(manifest).items() if k != "source_id"}
+    Deliberately *not* the default architecture: the regression this ticket exists for is
+    an export path that hardcodes its configuration, which only shows up on a checkpoint
+    that was trained with something else.
+    """
+    spec = LocalEncoderSpec(layers=2, ffn_hidden=64, window=16, boundary_predictor="mlp")
+    encoder = build_byteified_encoder(tiny_source_encoder, tiny_source_tokenizer, spec)
+    path = tmp_path / "stage1.pt"
+    torch.save(
+        {
+            "encoder": encoder.state_dict(),
+            "config": {"seed": 3, "model": "tiny", **spec.to_config()},
+            "step": 7,
+        },
+        path,
     )
-    assert "source_id is empty" in bad.validate()
+    return encoder, path
 
 
-def test_validate_rejects_invalid_family(manifest):
-    bad = Manifest(
-        **{k: v for k, v in asdict(manifest).items() if k != "family"
-       }
+@pytest.fixture()
+def rule(tiny_source_tokenizer):
+    from byteify.alignment import discover_special_bytes
+
+    specials = discover_special_bytes(tiny_source_tokenizer)
+    return rule_for_family("bytelevel", n_byte_values=256 + len(specials), special_tokens=specials)
+
+
+# -- the manifest is enough ------------------------------------------------
+
+
+def test_an_artifact_loads_through_its_manifest_alone(
+    tmp_path: Path, trained_encoder, tiny_source_encoder, tiny_source_tokenizer, rule
+):
+    """Export an artifact, reload it with only the manifest, and embed text.
+
+    Nothing else is supplied: no checkpoint path, no tokenizer, no architecture flags.
+    """
+    encoder, checkpoint = trained_encoder
+    embedder = ByteifiedEmbedder(encoder, tiny_source_encoder, n_patches=16).eval()
+
+    artifact = tmp_path / "artifact"
+    export_artifact(
+        embedder,
+        tiny_source_tokenizer,
+        checkpoint,
+        artifact,
+        budget=16,
+        max_bytes=128,
     )
-    assert "family is empty" in bad.validate()
+
+    _, reloaded = load_artifact(artifact)
+
+    texts = ["the quick brown fox", "def f(x): return x", "日本語のテキスト"]
+    for text in texts:
+        ids, expanded, mask = reloaded.inputs_for_text(text)
+        with torch.no_grad():
+            original = embedder(ids, expanded, mask)
+            through_manifest = reloaded(ids, expanded, mask)
+        assert torch.allclose(original, through_manifest, atol=1e-6)
 
 
-def test_validate_rejects_invalid_budget(manifest):
-    # Explicitly pass budget=0 to trigger the validation error.
-    bad = Manifest(
-        budget=0,
-        **{k: v for k, v in asdict(manifest).items()
-           if k not in ("budget", "gate")}
+def test_the_manifest_carries_the_encoder_architecture(
+    tmp_path: Path, trained_encoder, tiny_source_encoder, tiny_source_tokenizer, rule
+):
+    """A checkpoint trained with a non-default interface reloads and describes itself."""
+    encoder, checkpoint = trained_encoder
+    embedder = ByteifiedEmbedder(encoder, tiny_source_encoder, n_patches=16).eval()
+
+    manifest = export_artifact(
+        embedder,
+        tiny_source_tokenizer,
+        checkpoint,
+        tmp_path / "artifact",
+        budget=16,
+        max_bytes=128,
     )
-    assert "budget must be > 0" in bad.validate()
+
+    assert manifest.encoder_arch["layers"] == 2
+    assert manifest.encoder_arch["ffn_hidden"] == 64
+    assert manifest.encoder_arch["window"] == 16
+    # And it reads back as a spec that rebuilds the same interface.
+    spec = LocalEncoderSpec.from_config(manifest.encoder_arch)
+    assert (spec.layers, spec.ffn_hidden, spec.window) == (2, 64, 16)
 
 
-def test_validate_rejects_invalid_d_model(manifest):
-    bad = Manifest(
-        **{k: v for k, v in asdict(manifest).items() if k != "source_d_model"}
+def test_the_manifest_records_the_byte_value_count_the_weights_actually_have(
+    trained_encoder, tiny_source_encoder, rule
+):
+    """The byte table's size comes from the weights, not from a config key.
+
+    A 263-row byte table described as 256 is not cosmetic: a loader that trusts the
+    manifest builds a byte embedding of the wrong shape and fails at load time.
+    """
+    encoder, checkpoint = trained_encoder
+    real_rows = int(encoder.embed.byte.weight.shape[0])
+    assert real_rows > 256  # the fixture must actually exercise this
+
+    manifest = manifest_from_checkpoint(
+        checkpoint,
+        source=tiny_source_encoder,
+        budget=16,
+        max_bytes=128,
+        rule=rule,
     )
-    assert "source_d_model must be > 0" in bad.validate()
+    assert manifest.n_byte_values == real_rows
+    assert manifest.vocab_size == int(encoder.embed.suffix.weight.shape[0])
 
 
-# -- from_checkpoint ----------------------------------------------------
+def test_the_patch_budget_is_an_argument_not_a_default(
+    trained_encoder, tiny_source_encoder, rule
+):
+    """The budget the manifest states is the budget the artifact was built with.
+
+    The budget is the axis the serving guarantee rests on (ADR 0002). A manifest that
+    defaulted it would describe an artifact nobody built.
+    """
+    _, checkpoint = trained_encoder
+    for budget in (16, 64, 200):
+        manifest = manifest_from_checkpoint(
+            checkpoint,
+            source=tiny_source_encoder,
+            budget=budget,
+            max_bytes=128,
+            rule=rule,
+        )
+        assert manifest.budget == budget
 
 
-def _make_ckpt(tmp_path: Path, extra_config: dict | None = None) -> Path:
-    """Create a minimal stage1.pt in tmp_path and return its path."""
-    pt_path = tmp_path / "stage1.pt"
-    ckpt = {
-        "encoder": {"dummy": torch.tensor([1.0])},
-        "config": {"max_bytes": 100, "seed": 0, **(extra_config or {})},
-        "step": 1,
-    }
-    torch.save(ckpt, pt_path)
-    return pt_path
+def test_a_manifest_without_a_budget_is_refused(tmp_path: Path, rule):
+    with pytest.raises(TypeError):
+        # There is deliberately no default for budget or max_bytes.
+        manifest_from_checkpoint(tmp_path / "nope.pt", source=object(), rule=rule)
 
 
-def _load_real_tokenizer():
-    """Load bert-base-uncased for from_checkpoint tests."""
-    tok = AutoTokenizer.from_pretrained("bert-base-uncased")
-    class _Mock:
-        strategy = "wordpiece"
-        def get_vocab(self):
-            return tok.get_vocab()
-    return _Mock()
-
-
-def test_from_checkpoint_builds_manifest(tmp_path: Path):
-    """from_checkpoint reads a .pt file and produces a Manifest."""
-    _make_ckpt(tmp_path, {
-        "model_id": "test-model",
-        "local_layers": 2,
-        "local_backend": "attention",
-        "local_window": 64,
-        "local_ffn_hidden": 512,
-        "boundary_predictor": "mlp",
-        "n_patches": 32,
-        "n_byte_values": 260,
-        "seed": 7,
-    })
-
-    class MockSource:
-        d_model = 768
-        n_layers = 12
-
-    m = from_checkpoint(
-        tmp_path, "test-model", source=MockSource(),
-        tokenizer=_load_real_tokenizer(),
-        family="wordpiece",
+def test_the_manifest_records_the_family_the_trie_rule_and_coverage(
+    tmp_path: Path, trained_encoder, tiny_source_encoder, tiny_source_tokenizer, rule
+):
+    encoder, checkpoint = trained_encoder
+    embedder = ByteifiedEmbedder(encoder, tiny_source_encoder, n_patches=16).eval()
+    manifest = export_artifact(
+        embedder,
+        tiny_source_tokenizer,
+        checkpoint,
+        tmp_path / "artifact",
+        budget=16,
+        max_bytes=128,
+        coverage_texts=["the quick brown fox", "日本語のテキスト"],
     )
-    assert m.source_id == "test-model"
-    assert m.source_d_model == 768
-    assert m.source_n_layers == 12
-    assert m.family == "wordpiece"
-    assert m.byte_stream_rule == "raw-utf8"
-    assert m.encoder_arch["layers"] == 2
-    assert m.seed == 7
-    assert m.validate() == []
+    assert manifest.family == "bytelevel"
+    assert manifest.byte_stream_rule == "nfc"
+    assert manifest.trie.coverage is not None
+    assert manifest.trie.coverage_bytes > 0
+    assert manifest.trie.sha256
 
 
-def test_from_checkpoint_finds_first_pt(tmp_path: Path):
-    """If no stage1.pt exists, the first .pt file is used."""
-    _make_ckpt(tmp_path)
-    (tmp_path / "other.pt").write_text("")  # dummy
+def test_inference_inputs_need_no_source_tokenizer(
+    tmp_path: Path, trained_encoder, tiny_source_encoder, tiny_source_tokenizer, rule
+):
+    """The shipped trie is enough to expand bytes into suffix ids."""
+    from byteify.alignment import align_text
 
-    m = from_checkpoint(
-        tmp_path, "m", tokenizer=_load_real_tokenizer(),
+    encoder, checkpoint = trained_encoder
+    embedder = ByteifiedEmbedder(encoder, tiny_source_encoder, n_patches=16).eval()
+    artifact = tmp_path / "artifact"
+    export_artifact(
+        embedder, tiny_source_tokenizer, checkpoint, artifact,
+        budget=16, max_bytes=128,
     )
-    assert m.max_bytes == 100
+    _, reloaded = load_artifact(artifact)
 
+    text = "日本語のテキスト"
+    ids, expanded, _ = reloaded.inputs_for_text(text)
+    # Same bytes training would have produced, and the same suffix ids the trie yields.
+    from byteify.alignment import discover_special_bytes
 
-def test_from_checkpoint_no_pt_file(tmp_path: Path):
-    """Raises if no .pt file is found."""
-    with pytest.raises(FileNotFoundError):
-        from_checkpoint(tmp_path, "m")
-
-
-def test_from_checkpoint_with_history(tmp_path: Path):
-    """Gate results are extracted from history.json when present."""
-    _make_ckpt(tmp_path)
-    history = [
-        {"step": 1, "cos_emb_c": 0.92, "sim_corr": 0.89,
-         "boundary_acc": 0.95, "nn_agree": 0.80},
-    ]
-    (tmp_path / "history.json").write_text(json.dumps(history))
-
-    m = from_checkpoint(tmp_path, "m", tokenizer=_load_real_tokenizer())
-    assert m.gate is not None
-    assert m.gate.cos_emb == 0.92
-    assert m.gate.sim_corr == 0.89
-    assert m.gate.gate_passed  # 0.92 >= 0.90 and 0.89 >= 0.85
-
-
-def test_from_checkpoint_gate_fails_history(tmp_path: Path):
-    """Gate is marked failed when fidelity is below thresholds."""
-    _make_ckpt(tmp_path)
-    history = [
-        {"step": 1, "cos_emb_c": 0.80, "sim_corr": 0.70,
-         "boundary_acc": 0.90, "nn_agree": 0.50},
-    ]
-    (tmp_path / "history.json").write_text(json.dumps(history))
-
-    m = from_checkpoint(tmp_path, "m", tokenizer=_load_real_tokenizer())
-    assert m.gate is not None
-    assert m.gate.cos_emb == 0.80
-    assert not m.gate.gate_passed  # 0.80 < 0.90
-
-
-def test_manifest_family_wordpiece_sets_raw_utf8(tmp_path: Path):
-    """WordPiece families get byte_stream_rule='raw-utf8'."""
-    _make_ckpt(tmp_path)
-    m = from_checkpoint(
-        tmp_path, "m", tokenizer=_load_real_tokenizer(),
-        family="wordpiece",
+    training = align_text(
+        text,
+        tiny_source_tokenizer,
+        special_token_ids=discover_special_bytes(tiny_source_tokenizer),
+        add_special_tokens=True,
     )
-    assert m.byte_stream_rule == "raw-utf8"
+    assert ids[0].tolist() == list(training.byte_ids)
+    assert len(expanded[0]) == len(training.byte_ids)
 
 
-def test_manifest_validation_rejects_invalid_schema():
-    bad = Manifest(schema_version="99", source_id="x", family="w",
-                   byte_stream_rule="x", source_d_model=1, source_n_layers=1,
-                   budget=1, max_bytes=1, vocab_size=1)
-    errors = bad.validate()
-    assert any("schema version" in e for e in errors)
+def test_a_tampered_trie_is_refused(tmp_path: Path, trained_encoder, tiny_source_encoder,
+                                    tiny_source_tokenizer, rule):
+    """The manifest records the trie's hash, so a corrupted artifact does not load."""
+    encoder, checkpoint = trained_encoder
+    embedder = ByteifiedEmbedder(encoder, tiny_source_encoder, n_patches=16).eval()
+    artifact = tmp_path / "artifact"
+    manifest = export_artifact(
+        embedder, tiny_source_tokenizer, checkpoint, artifact,
+        budget=16, max_bytes=128,
+    )
+
+    trie_path = artifact / manifest.trie.path
+    payload = json.loads(trie_path.read_text())
+    payload[min(payload)] = "00"
+    trie_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ManifestError, match="sha256"):
+        load_artifact(artifact)
+
+
+def test_a_missing_trie_is_refused(tmp_path: Path, trained_encoder, tiny_source_encoder,
+                                   tiny_source_tokenizer, rule):
+    encoder, checkpoint = trained_encoder
+    embedder = ByteifiedEmbedder(encoder, tiny_source_encoder, n_patches=16).eval()
+    artifact = tmp_path / "artifact"
+    export_artifact(
+        embedder, tiny_source_tokenizer, checkpoint, artifact,
+        budget=16, max_bytes=128,
+    )
+    (artifact / "trie.json").unlink()
+    with pytest.raises(ManifestError, match="trie"):
+        load_artifact(artifact)
+
+
+# -- versioning -----------------------------------------------------------
+
+
+def test_an_unrecognised_major_version_is_refused(valid_manifest: Manifest):
+    from dataclasses import replace
+
+    future = replace(valid_manifest, schema_version="99.0")
+    with pytest.raises(UnsupportedSchemaVersion):
+        Manifest.from_json(future.to_json())
+
+
+def test_a_later_minor_version_still_loads(valid_manifest: Manifest):
+    from dataclasses import replace
+
+    newer_minor = replace(valid_manifest, schema_version="1.7")
+    assert Manifest.from_json(newer_minor.to_json()).budget == valid_manifest.budget
+
+
+def test_a_malformed_version_is_refused(valid_manifest: Manifest):
+    from dataclasses import replace
+
+    broken = replace(valid_manifest, schema_version="one")
+    with pytest.raises(ManifestError):
+        Manifest.from_json(broken.to_json())
+
+
+def test_a_refused_version_is_refused_on_disk_too(valid_manifest: Manifest, tmp_path: Path):
+    from dataclasses import replace
+
+    path = tmp_path / "manifest.json"
+    replace(valid_manifest, schema_version="2.0").write_to(path)
+    with pytest.raises(UnsupportedSchemaVersion):
+        Manifest.from_file(path)
+
+
+# -- validation -----------------------------------------------------------
+
+
+def test_a_valid_manifest_has_nothing_to_report(valid_manifest: Manifest):
+    assert valid_manifest.validate() == []
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        ("source_id", "source_id is empty"),
+        ("family", "family is empty"),
+        ("byte_stream_rule", "byte_stream_rule is empty"),
+        ("source_d_model", "source_d_model must be > 0"),
+        ("source_n_layers", "source_n_layers must be > 0"),
+        ("budget", "budget must be > 0"),
+        ("max_bytes", "max_bytes must be > 0"),
+        ("vocab_size", "vocab_size must be > 0"),
+        ("byte_stream", "byte_stream is empty"),
+    ],
+)
+def test_each_missing_field_is_named(valid_manifest: Manifest, field: str, expected: str):
+    from dataclasses import replace
+
+    bad = replace(valid_manifest, **{field: type(getattr(valid_manifest, field))()})
+    assert any(expected in e for e in bad.validate()), bad.validate()
+
+
+def test_a_byte_table_smaller_than_the_byte_alphabet_is_refused(valid_manifest: Manifest):
+    from dataclasses import replace
+
+    bad = replace(valid_manifest, n_byte_values=255)
+    assert any("n_byte_values" in e for e in bad.validate())
+
+
+def test_an_encoder_arch_missing_a_field_is_refused(valid_manifest: Manifest):
+    from dataclasses import replace
+
+    arch = {k: v for k, v in valid_manifest.encoder_arch.items() if k != "ffn_hidden"}
+    bad = replace(valid_manifest, encoder_arch=arch)
+    assert any("ffn_hidden" in e for e in bad.validate())
+
+
+def test_an_artifact_whose_recorded_gate_failed_is_refused(valid_manifest: Manifest):
+    from dataclasses import replace
+
+    from byteify import GateResults
+
+    failed = replace(valid_manifest, gate=GateResults(cos_emb=0.1, gate_passed=False))
+    assert any("gate" in e for e in failed.validate())
+
+
+def test_an_invalid_manifest_on_disk_is_refused_with_its_reasons(
+    valid_manifest: Manifest, tmp_path: Path
+):
+    from dataclasses import replace
+
+    path = tmp_path / "manifest.json"
+    replace(valid_manifest, budget=0, source_id="").write_to(path)
+    with pytest.raises(ManifestError) as excinfo:
+        Manifest.from_file(path)
+    assert "budget" in str(excinfo.value)
+
+
+def test_loading_a_missing_manifest_says_so(tmp_path: Path):
+    with pytest.raises(ManifestError, match="no manifest"):
+        Manifest.load(tmp_path)
+
+
+def test_a_manifest_that_is_not_json_says_so(tmp_path: Path):
+    path = tmp_path / "manifest.json"
+    path.write_text("{not json")
+    with pytest.raises(ManifestError, match="not valid JSON"):
+        Manifest.from_file(path)
+
+
+# -- round trip -----------------------------------------------------------
+
+
+def test_a_manifest_survives_json_unchanged(valid_manifest: Manifest):
+    from dataclasses import asdict
+
+    assert asdict(Manifest.from_json(valid_manifest.to_json())) == asdict(valid_manifest)
+
+
+def test_the_gate_survives_json_with_its_thresholds(valid_manifest: Manifest):
+    from dataclasses import replace
+
+    from byteify import GateResults
+
+    gated = replace(
+        valid_manifest,
+        gate=GateResults(cos_emb=0.93, sim_corr=0.88, thresholds={"cos_emb": 0.90}),
+    )
+    back = Manifest.from_json(gated.to_json())
+    assert back.gate.thresholds == {"cos_emb": 0.90}
+    assert back.gate.cos_emb == 0.93
+
+
+def test_writing_a_manifest_is_atomic(valid_manifest: Manifest, tmp_path: Path):
+    """A half-written manifest is worse than none: it names an artifact that may not exist."""
+    path = tmp_path / "manifest.json"
+    valid_manifest.write_to(path)
+    assert json.loads(path.read_text())["budget"] == 64
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+# -- the trie -------------------------------------------------------------
+
+
+def test_the_trie_survives_a_write_and_read(tmp_path: Path):
+    token_bytes = {0: b"a", 1: b"the", 2: b"\xf0\x9f\x99\x82", 3: b""}
+    path = tmp_path / "trie.json"
+    digest = write_trie(path, token_bytes)
+    assert len(digest) == 64
+    # The empty entry is dropped: a zero-length token covers no byte.
+    assert read_trie(path) == {0: b"a", 1: b"the", 2: b"\xf0\x9f\x99\x82"}
+
+
+def test_an_artifact_written_atomically_leaves_no_temp_files(
+    tmp_path: Path, trained_encoder, tiny_source_encoder, tiny_source_tokenizer, rule
+):
+    encoder, checkpoint = trained_encoder
+    embedder = ByteifiedEmbedder(encoder, tiny_source_encoder, n_patches=16).eval()
+    artifact = tmp_path / "artifact"
+    export_artifact(
+        embedder, tiny_source_tokenizer, checkpoint, artifact,
+        budget=16, max_bytes=128,
+    )
+    assert not list(artifact.glob("*.tmp"))
+    assert (artifact / "manifest.json").exists()

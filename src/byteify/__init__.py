@@ -20,6 +20,7 @@ from .alignment import (
     discover_special_bytes,
 )
 from .boundary_merge import bpe_merge_patches, merge_batch, merge_boundaries
+from .bytestream import ByteStreamRule, rule_for_family
 from .contrastive import (
     ContrastiveHead,
     ProjectionHead,
@@ -28,7 +29,7 @@ from .contrastive import (
     pair_batches,
     retrieval_metrics,
 )
-from .data import BatchSampler, iter_texts
+from .data import BatchSampler, iter_texts, truncate_to_bytes
 from .expand import ByteTrie, expand_byte_ids
 from .inference import (
     BudgetedPatches,
@@ -38,6 +39,7 @@ from .inference import (
     pool_budgeted_patches,
     select_budgeted_patches,
 )
+from .loader import build_embedder_from_manifest
 from .losses import (
     Stage1Weights,
     boundary_loss,
@@ -48,10 +50,15 @@ from .losses import (
     stitching_loss,
 )
 from .manifest import (
+    MANIFEST_NAME,
     GateResults,
     Manifest,
-    export_with_manifest,
-    from_checkpoint,
+    ManifestError,
+    UnsupportedSchemaVersion,
+    export_artifact,
+    load_artifact,
+    manifest_from_checkpoint,
+    write_trie,
 )
 from .model import (
     ByteEmbedding,
@@ -89,12 +96,14 @@ from .task_arithmetic import apply_delta, delta, task_arithmetic_merge
 from .vocab import VocabByteResolution, build_suffix_trie, resolve_token_bytes
 
 __all__ = [
+    "MANIFEST_NAME",
     "SPECIAL_TOKENS",
     "Alignment",
     "BatchSampler",
     "BudgetedPatches",
     "ByteBatch",
     "ByteEmbedding",
+    "ByteStreamRule",
     "ByteTrie",
     "ByteifiedEmbedder",
     "ByteifiedEncoder",
@@ -109,13 +118,16 @@ __all__ = [
     "LocalEncoderSpec",
     "LocalFeedForward",
     "LocalGRU",
+    "MLMBoundaryPredictor",
     "MLPBoundaryPredictor",
     "Manifest",
+    "ManifestError",
     "PartialModernBert",
     "ProjectionHead",
     "RMSNorm",
     "SourceEncoder",
     "Stage1Weights",
+    "UnsupportedSchemaVersion",
     "VocabByteResolution",
     "align",
     "align_from_offsets",
@@ -125,6 +137,8 @@ __all__ = [
     "bpe_merge_patches",
     "budgeted_patches_mask",
     "build_byteified_encoder",
+    "build_embedder_from_manifest",
+    "build_encoder_from_dimensions",
     "build_suffix_trie",
     "bytes_to_unicode",
     "cos_sim",
@@ -133,12 +147,14 @@ __all__ = [
     "embedding_loss",
     "encode_texts",
     "expand_byte_ids",
+    "export_artifact",
     "export_onnx",
-    "export_with_manifest",
-    "from_checkpoint",
     "infonce",
     "iter_texts",
+    "load_artifact",
     "load_byteified_encoder",
+    "load_encoder_state",
+    "manifest_from_checkpoint",
     "masked_byte_loss",
     "masked_l2",
     "merge_batch",
@@ -152,10 +168,13 @@ __all__ = [
     "resolve_source_encoder",
     "resolve_token_bytes",
     "retrieval_metrics",
+    "rule_for_family",
     "sample_mlm_mask",
     "select_budgeted_patches",
     "stitching_loss",
     "task_arithmetic_merge",
     "teacher_states",
     "tokenizer_tables",
+    "truncate_to_bytes",
+    "write_trie",
 ]

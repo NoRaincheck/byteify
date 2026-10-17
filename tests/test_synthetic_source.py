@@ -47,7 +47,10 @@ def test_every_synthetic_tokenizer_segments_text_it_can_reassemble(tiny_tokenize
         assert len(ids) > 1, f"{family} collapsed the whole input into one token"
 
         offsets = tokenizer(text, return_offsets_mapping=True)["offset_mapping"]
-        starts = [start for start, _ in offsets]
+        # Special tokens report (0, 0) wherever they sit, so the ordering guarantee is
+        # about the tokens that actually cover text. Including them would fail on a
+        # trailing [SEP].
+        starts = [start for start, end in offsets if end > start]
         assert starts == sorted(starts), f"{family} produced out-of-order offsets"
         assert all(0 <= start <= end <= len(text) for start, end in offsets), (
             f"{family} produced an offset outside the input"

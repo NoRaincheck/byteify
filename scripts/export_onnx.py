@@ -23,9 +23,10 @@ from pathlib import Path
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-from byteify.inference import ByteifiedEmbedder, byte_ids_for_inference, export_onnx
-from byteify.manifest import export_with_manifest
+from byteify.inference import ByteifiedEmbedder
+from byteify.manifest import export_artifact
 from byteify.source import HuggingFaceSourceEncoder, load_byteified_encoder
+from byteify.vocab import resolve_token_bytes
 
 SAMPLES = [
     "The quick brown fox jumps over the lazy dog.",
@@ -38,11 +39,10 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="jhu-clsp/ettin-encoder-17m")
     p.add_argument("--init", default=None, help="trained checkpoint to export")
-    p.add_argument("--out", default="byteified_embedder.onnx")
+    p.add_argument("--out", default="artifact.onnx", help="graph file name")
+    p.add_argument("--out-dir", default=None, help="artifact directory (default: --out's)")
     p.add_argument("--max-bytes", type=int, default=512)
     p.add_argument("--n-patches", type=int, default=64)
-    p.add_argument("--opset", type=int, default=18,
-                   help="minimum 18: the dynamo exporter requires it")
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--device", default="cpu")
     p.add_argument("--atol", type=float, default=1e-4)
@@ -51,28 +51,59 @@ def parse_args():
 
 def build(args, device):
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    source = HuggingFaceSourceEncoder(AutoModel.from_pretrained(args.model)).to(device).eval()
+    source = HuggingFaceSourceEncoder(
+        AutoModel.from_pretrained(args.model), model_id=args.model
+    ).to(device).eval()
 
-    if args.init:
-        # The architecture comes out of the checkpoint. Rebuilding it from constants here
-        # produced a different shape for any checkpoint not trained with those constants.
-        encoder = load_byteified_encoder(args.init, source, tokenizer)
-        encoder = encoder.to(device)
-        print(f"loaded {args.init}")
-    else:
-        from byteify.source import build_byteified_encoder
+    # A checkpoint is required. Exporting a randomly initialised interface produces a
+    # graph that loads and matches eager PyTorch perfectly, which is precisely why the
+    # fidelity gate exists and why this script will not make the artifact for you.
+    if not args.init:
+        raise SystemExit(
+            "--init is required: an artifact must be built from trained weights, not "
+            "from a randomly initialised byte interface"
+        )
+    encoder = load_byteified_encoder(args.init, source, tokenizer).to(device).eval()
+    print(f"loaded {args.init}")
 
-        encoder = build_byteified_encoder(source, tokenizer)
-        encoder.embed.load_suffix_from(source.embedding_matrix())
-        print("no --init given: exporting a randomly initialised local encoder")
-    encoder = encoder.eval()
-    return tokenizer, source, encoder
+    # The same rule and trie the artifact will carry, so the graph is verified against
+    # the inputs a serving host will actually hand it.
+    from byteify.alignment import discover_special_bytes
+    from byteify.bytestream import rule_for_family
+    from byteify.vocab import build_suffix_trie
+
+    specials = discover_special_bytes(tokenizer)
+    rule = rule_for_family(
+        resolve_token_bytes(tokenizer).strategy,
+        n_byte_values=256 + len(specials),
+        special_tokens=specials,
+    )
+    trie, _ = build_suffix_trie(tokenizer)
+    return tokenizer, source, encoder, rule, trie
+
+
+def _inputs_from_rule(rule, trie, text: str, max_bytes: int):
+    """Build graph inputs from the declared byte-stream rule, not from the tokenizer.
+
+    This is the path a serving host takes. Verifying the graph against inputs built this
+    way is the point: verifying against tokenizer-produced inputs would only prove the
+    graph agrees with a path it will never be given.
+    """
+    from byteify.expand import expand_byte_ids
+
+    byte_ids = rule.build(text, max_bytes)
+    expanded = expand_byte_ids(byte_ids, trie, pseudo_byte_to_token=rule.pseudo_bytes)
+    return (
+        torch.tensor([byte_ids], dtype=torch.long),
+        torch.tensor([expanded], dtype=torch.long),
+        torch.ones(1, len(byte_ids), dtype=torch.long),
+    )
 
 
 def main():
     args = parse_args()
     device = args.device
-    tokenizer, source, encoder = build(args, device)
+    tokenizer, source, encoder, rule, trie = build(args, device)
     embedder = ByteifiedEmbedder(encoder, source, n_patches=args.n_patches).to(device).eval()
 
     # Pad a batch to a common byte length, as a real serving path would.
@@ -83,7 +114,10 @@ def main():
     def pad_to_width(tensor):
         return torch.nn.functional.pad(tensor, (0, width - tensor.shape[1]))
 
-    prepared = [byte_ids_for_inference(tokenizer, t, args.max_bytes) for t in SAMPLES[: args.batch_size]]
+    prepared = [
+        _inputs_from_rule(rule, trie, t, args.max_bytes)
+        for t in SAMPLES[: args.batch_size]
+    ]
 
     def pad(tensors, value):
         # Accept either [1, n] or [n] rows; both are flattened to a single axis first.
@@ -106,38 +140,34 @@ def main():
     print(f"export shapes: byte_ids={tuple(byte_ids.shape)} "
           f"expanded={tuple(expanded.shape)} mask={tuple(byte_mask.shape)} "
           f"n_patches={args.n_patches}")
-    path = export_onnx(
+
+    # One call writes the graph, the trie, the encoder weights and the manifest, and
+    # refuses to write a manifest that does not describe what it just exported. The
+    # manifest goes last: until it exists the directory is not an artifact.
+    artifact_dir = Path(args.out_dir) if args.out_dir else Path(args.out).parent
+    manifest = export_artifact(
         embedder,
         tokenizer,
-        path=args.out,
+        checkpoint=Path(args.init),
+        output_dir=artifact_dir,
+        budget=args.n_patches,
         max_bytes=args.max_bytes,
-        n_patches=args.n_patches,
-        opset=args.opset,
-        # Export for the exact shape we verify against, so the traced graph and the
-        # eager path are known to be comparable.
+        coverage_texts=SAMPLES,
+        graph_name=Path(args.out).name,
         example_batch=(byte_ids, expanded, byte_mask),
     )
-    size_mb = __import__("os").path.getsize(path) / 1e6
+    path = artifact_dir / Path(args.out).name
+    size_mb = path.stat().st_size / 1e6
     print(f"exported {path} ({size_mb:.1f} MB)")
-
-    # Write the manifest alongside the ONNX graph.  Hard-fail: if the
-    # manifest write fails, the ONNX file is already written but the
-    # artifact is not complete — a practitioner would know to remove it.
-    # (The manifest module validates itself; errors are raised early.)
-    onnx_dir = Path(args.out).parent
-    onnx_dir.mkdir(parents=True, exist_ok=True)
-    _, manifest_path, manifest = export_with_manifest(
-        checkpoint_dir=args.init if args.init else "",
-        output_dir=onnx_dir,
-        source_id=args.model,
-        source_revision="",
-        source=source,
-        tokenizer=tokenizer,
-        n_patches=args.n_patches,
-        max_bytes=args.max_bytes,
-    )
-    manifest.write_to(manifest_path)
-    print(f"wrote {manifest_path}")
+    print(f"wrote {artifact_dir / 'manifest.json'}")
+    print(f"  source      {manifest.source_id} ({manifest.architecture})")
+    print(f"  family      {manifest.family}, byte stream {manifest.byte_stream_rule}")
+    print(f"  byte axis   {manifest.max_bytes}, patch budget {manifest.budget}")
+    print(f"  byte table  {manifest.n_byte_values} values, vocab {manifest.vocab_size}")
+    if manifest.trie.coverage is not None:
+        print(f"  trie        {manifest.trie.entries} entries, "
+              f"{manifest.trie.coverage * 100:.1f}% coverage over "
+              f"{manifest.trie.coverage_bytes} bytes")
 
     # --- numerical verification -------------------------------------------------
     with torch.no_grad():

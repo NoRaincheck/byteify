@@ -133,7 +133,15 @@ def synthetic_corpus(n: int = 600) -> list[str]:
 
 def build_tokenizer(family: str, corpus: list[str]):
     """A real fast tokenizer for one of the three families byteification supports."""
-    from tokenizers import Tokenizer, decoders, models, normalizers, pre_tokenizers, trainers
+    from tokenizers import (
+        Tokenizer,
+        decoders,
+        models,
+        normalizers,
+        pre_tokenizers,
+        processors,
+        trainers,
+    )
     from transformers import PreTrainedTokenizerFast
 
     special = ["[UNK]", "[CLS]", "[SEP]", "[PAD]", "[MASK]"]
@@ -159,13 +167,26 @@ def build_tokenizer(family: str, corpus: list[str]):
         )
         backend.decoder = decoders.Metaspace()
         trainer = trainers.UnigramTrainer(
-            vocab_size=400, special_tokens=special, show_progress=False
+            vocab_size=400, special_tokens=special, unk_token="[UNK]", show_progress=False
         )
         kwargs = {"unk_token": "[UNK]", "mask_token": "[MASK]"}
     else:
         raise ValueError(f"unknown tokenizer family {family!r}")
 
     backend.train_from_iterator(corpus, trainer)
+
+    # A real tokenizer in every family byteify supports brackets its output with the class
+    # and separator tokens. Without this the fixture emits no pseudo-bytes, which hides
+    # exactly the behaviour the byte-stream rule has to reproduce: the encoder was trained
+    # with pseudo-bytes at positions 0 and N-1 and has never seen the stream without them.
+    backend.post_processor = processors.TemplateProcessing(
+        single="[CLS] $A [SEP]",
+        pair="[CLS] $A [SEP] $B:1",
+        special_tokens=[
+            ("[CLS]", backend.token_to_id("[CLS]")),
+            ("[SEP]", backend.token_to_id("[SEP]")),
+        ],
+    )
 
     return PreTrainedTokenizerFast(
         tokenizer_object=backend,

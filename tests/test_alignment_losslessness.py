@@ -25,6 +25,16 @@ def _bytes_of(text: str) -> bytes:
     return text.encode("utf-8")
 
 
+def _brackets(specials: dict[int, int]) -> tuple[int, int]:
+    """The two pseudo-bytes that bracket the stream, in discovery order.
+
+    ``discover_special_bytes`` probes class, separator, pad, mask in that order, so the
+    first two values it assigns are the ones that frame the byte axis.
+    """
+    values = list(specials.values())
+    return values[0], values[1]
+
+
 def test_bytelevel_bpe_is_lossless(corpus):
     """Byte-level BPE must produce exactly the raw UTF-8 bytes of NFC-normalised text,
     which is exactly what the byte-level route does: concatenate per-token byte strings.
@@ -45,8 +55,10 @@ def test_wordpiece_alignment_is_lossless(corpus):
     The only corruption (overlapping spans) is now handled by skipping forward.
     """
     tokenizer = build_tokenizer("wordpiece", corpus[:200])
+    specials = discover_special_bytes(tokenizer)
+    open_pseudo, close_pseudo = _brackets(specials)
     text = "byte level retrofit 日本語 한국어"
-    alignment = align_text(text, tokenizer)
+    alignment = align_text(text, tokenizer, special_token_ids=specials)
     # Get the normalizer's output text and compare its bytes directly.
     normalizer = getattr(
         getattr(tokenizer, "backend_tokenizer", None), "normalizer", None
@@ -54,14 +66,14 @@ def test_wordpiece_alignment_is_lossless(corpus):
     normalised_text = (
         normalizer.normalize_str(text) if normalizer is not None else text
     )
-    # The byte stream (minus trailing [SEP], if any) must equal the normalised
-    # text's bytes.  The byte stream starts with a CLS pseudo-byte, which
-    # happens to equal the 'b' in "byte" (both are 98); stripping it would
-    # lose the 'b'.  Keep it and compare.
-    assert bytes(alignment.byte_ids) == normalised_text.encode("utf-8"), (
+    # Pseudo-bytes bracket the stream at both ends, and they are not bytes at all, so the
+    # comparison has to take them off first. Comparing the whole sequence used to be
+    # impossible here -- it only worked because the fixture emitted no pseudo-bytes.
+    bracketed = list(alignment.byte_ids)
+    expected = [open_pseudo] + list(normalised_text.encode("utf-8")) + [close_pseudo]
+    assert bracketed == expected, (
         f"WordPiece alignment does not match the normalizer's output: "
-        f"aligned {len(alignment.byte_ids)} bytes vs "
-        f"normalizer {len(normalised_text.encode('utf-8'))} bytes"
+        f"aligned {len(bracketed)} bytes vs normalizer {len(expected)} expected"
     )
 
 
@@ -85,12 +97,12 @@ def test_sentencepiece_alignment_is_lossless(corpus):
 def test_token_and_inference_produce_identical_byte_streams(corpus):
     """Training and inference must produce the identical byte stream for the same text.
 
-    The existing special-token asymmetry (training: ``add_special_tokens=True``,
-    inference: ``False``) means the byte streams differ in their boundaries,
-    and the byte table reserves slots for pseudo-bytes that inference never emits.
+    Training runs with ``add_special_tokens=True`` and inference with ``False``, so the two
+    differ by exactly the bracketing pseudo-bytes -- the class and separator positions that
+    hold the byte axis in sync with the token axis. Inside the brackets they must agree
+    byte for byte, or the model that was trained is not the model that is served.
 
-    Once both paths go through the same route, the byte streams must be identical
-    for identical text, which is what this test checks.
+    This test previously ended in ``or True``, so it asserted nothing at all.
     """
     text = "byte level retrofit 日本語 한국어 Ω"
     for family in ("bytelevel", "wordpiece", "sentencepiece"):
@@ -104,7 +116,14 @@ def test_token_and_inference_produce_identical_byte_streams(corpus):
             text, tokenizer, special_token_ids=specials, add_special_tokens=False
         )
 
-        # Without special tokens, the byte streams must be identical.
-        assert without_special.byte_ids == with_special.byte_ids[len(with_special.input_ids) - 1] or True, (
-            f"{family}: without-special byte stream differs from inside with-special"
+        bracketed = list(with_special.byte_ids)
+        # The first and last positions are pseudo-bytes; the content between them is the
+        # stream both paths must agree on.
+        assert bracketed[1:-1] == list(without_special.byte_ids), (
+            f"{family}: the bracketed byte stream differs from the unbracketed one "
+            f"inside the brackets"
+        )
+        assert len(bracketed) == len(without_special.byte_ids) + 2, (
+            f"{family}: expected exactly two bracketing pseudo-bytes, got "
+            f"{len(bracketed) - len(without_special.byte_ids)}"
         )

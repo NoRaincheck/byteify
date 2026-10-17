@@ -32,14 +32,13 @@ during *training*; for deployment these come from the byte stream alone, see
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-if TYPE_CHECKING:
-    from .manifest import Manifest
+from .expand import expand_byte_ids
 
 
 def budgeted_patches_mask(mask: Tensor) -> Tensor:
@@ -119,14 +118,15 @@ def byte_ids_for_inference(tokenizer, text: str, max_bytes: int = 512) -> tuple[
     tokenizer's *segmentation*, only its *vocabulary*, so a reverse trie walk over the byte
     stream recovers the same ids. That keeps deployment free of any tokenizer call.
     """
-    from .alignment import align_text, discover_special_bytes
+    from .alignment import align_text, bracket_pseudo_bytes, discover_special_bytes
     from .expand import expand_byte_ids
 
     specials = discover_special_bytes(tokenizer)
     from .stitching import tokenizer_tables
 
     _, trie, _ = tokenizer_tables(tokenizer)
-    pseudo_to_token = {p: t for t, p in specials.items()}
+    # Only the bracketing pseudo-bytes are emitted; see `bracket_pseudo_bytes`.
+    pseudo_to_token = {p: t for t, p in bracket_pseudo_bytes(specials).items()}
 
     raw = text.encode("utf-8")[:max_bytes]
     decoded = raw.decode("utf-8", errors="ignore")
@@ -156,6 +156,9 @@ class ByteifiedEmbedder(nn.Module):
         n_patches: int = 128,
         threshold: float = 0.5,
         normalize: bool = True,
+        byte_trie=None,
+        byte_stream_rule=None,
+        byte_axis: int = 512,
     ) -> None:
         super().__init__()
         self.encoder = encoder
@@ -163,6 +166,53 @@ class ByteifiedEmbedder(nn.Module):
         self.n_patches = n_patches
         self.threshold = threshold
         self.normalize = normalize
+        # Set when the embedder was loaded from an artifact, which is what lets it turn
+        # text into graph inputs with no tokenizer present.
+        self.byte_trie = byte_trie
+        self.byte_stream_rule = byte_stream_rule
+        self.byte_axis = byte_axis
+
+    def inputs_for_text(self, text: str, max_bytes: int | None = None) -> tuple[Tensor, Tensor, Tensor]:
+        """``(byte_ids, expanded_ids, byte_mask)`` for one text, from the declared rule.
+
+        This is the tokenizer-free path: the byte stream comes from the rule recorded in
+        the manifest and the suffix ids from the reverse trie the artifact ships. Both are
+        ``None`` only if the embedder was constructed without them, in which case
+        :meth:`encode` needs a tokenizer and this method says so.
+        """
+        if self.byte_stream_rule is None or self.byte_trie is None:
+            raise RuntimeError(
+                "this embedder carries no byte-stream rule or trie, so it cannot build "
+                "inputs from text; load it with ByteifiedEmbedder.load(artifact_dir), or "
+                "use encode(tokenizer, texts)"
+            )
+        limit = max_bytes or self.byte_axis
+        byte_ids = self.byte_stream_rule.build(text, limit)
+        expanded = expand_byte_ids(
+            byte_ids, self.byte_trie, pseudo_byte_to_token=self.byte_stream_rule.pseudo_bytes
+        )
+        return (
+            torch.tensor([byte_ids], dtype=torch.long),
+            torch.tensor([expanded], dtype=torch.long),
+            torch.ones(1, len(byte_ids), dtype=torch.long),
+        )
+
+    @torch.no_grad()
+    def encode_text(self, texts: list[str], max_bytes: int | None = None) -> Tensor:
+        """Embed text directly. Requires an artifact-loaded embedder, not a tokenizer."""
+        rows = [self.inputs_for_text(t, max_bytes) for t in texts]
+        width = max(int(ids.shape[1]) for ids, _, _ in rows)
+
+        def pad(tensors: list[Tensor], value: int) -> Tensor:
+            return torch.cat(
+                [F.pad(t, (0, width - t.shape[1]), value=value) for t in tensors], dim=0
+            )
+
+        return self.forward(
+            pad([ids for ids, _, _ in rows], 0),
+            pad([exp for _, exp, _ in rows], -1),
+            pad([mask for _, _, mask in rows], 0),
+        )
 
     def forward(self, byte_ids: Tensor, expanded_ids: Tensor, byte_mask: Tensor) -> Tensor:
         n = min(self.n_patches, byte_ids.shape[1])
@@ -190,77 +240,28 @@ class ByteifiedEmbedder(nn.Module):
         )
 
     @classmethod
-    def from_manifest(
-        cls,
-        manifest: Manifest,
-        device: str = "cpu",
-    ) -> ByteifiedEmbedder:
-        """Reconstruct an embedder from a manifest + checkpoint.
+    def load(cls, artifact_dir, *, device: str = "cpu") -> ByteifiedEmbedder:
+        """Load an embedder from an artifact directory, through its manifest alone.
 
-        Reads ``stage1.pt`` from the manifest's checkpoint directory (or
-        the same directory where the manifest lives), loads the encoder
-        weights, and returns a ``ByteifiedEmbedder`` ready for inference.
-
-        Args:
-            manifest: a validated ``Manifest`` object.
-            device: device string (default ``"cpu"``).
-
-        Returns:
-            A fully-constructed ``ByteifiedEmbedder``.
+        No checkpoint path, no tokenizer, no architecture flags. Everything the encoder
+        needs is in the manifest, or in the artifact directory beside it.
         """
-        # Resolve the checkpoint directory from the manifest.  The
-        # manifest stores source_id but not the path; the convention is
-        # that the checkpoint directory is named after the source_id
-        # (with "/" replaced by "_").
-        import os
-        from pathlib import Path
+        from .loader import build_embedder_from_manifest
+        from .manifest import Manifest
 
-        from transformers import AutoModel, AutoTokenizer
+        artifact_dir = Path(artifact_dir)
+        manifest = Manifest.load(artifact_dir)
+        return build_embedder_from_manifest(manifest, artifact_dir, device=device)
 
-        from .source import (
-            HuggingFaceSourceEncoder,
-            LocalEncoderSpec,
-            build_byteified_encoder,
-            load_byteified_encoder,
-        )
+    @classmethod
+    def load_with_manifest(cls, artifact_dir, *, device: str = "cpu"):
+        """As :meth:`load`, but also return the manifest."""
+        from .loader import build_embedder_from_manifest
+        from .manifest import Manifest
 
-        ckpt_dir = Path(os.path.expanduser(
-            os.path.join("runs", manifest.source_id.replace("/", "_"))
-        ))
-
-        # Build source model and tokenizer from the manifest's source_id.
-        tokenizer = AutoTokenizer.from_pretrained(manifest.source_id)
-        source = HuggingFaceSourceEncoder(AutoModel.from_pretrained(manifest.source_id)).to(device)
-        source.eval()
-
-        # Build the byteified encoder from the manifest.
-        encoder_arch = manifest.encoder_arch
-        encoder = build_byteified_encoder(
-            source,
-            tokenizer,
-            LocalEncoderSpec(
-                layers=encoder_arch.get('layers', 1),
-                backend=encoder_arch.get('backend', 'attention'),
-                window=encoder_arch.get('window', 128),
-                ffn_hidden=encoder_arch.get('ffn_hidden', 1024),
-                boundary_predictor=encoder_arch.get('boundary_predictor', 'mlp'),
-            ),
-        ).to(device)
-
-        # Try to load weights from checkpoint if it exists.
-        pt_path = ckpt_dir / "stage1.pt"
-        if pt_path.exists():
-            encoder = load_byteified_encoder(str(pt_path), source, tokenizer).to(device)
-
-        encoder = encoder.eval()
-
-        return cls(
-            encoder=encoder,
-            source=source,
-            n_patches=manifest.budget,
-            threshold=0.5,
-            normalize=True,
-        )
+        artifact_dir = Path(artifact_dir)
+        manifest = Manifest.load(artifact_dir)
+        return manifest, build_embedder_from_manifest(manifest, artifact_dir, device=device)
 
 
 def _embedder_core(
