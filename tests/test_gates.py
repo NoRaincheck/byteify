@@ -318,6 +318,36 @@ def test_the_exported_graph_gate_catches_a_graph_that_computes_something_else(
     assert not wrong.passed
 
 
+def test_the_graph_gate_accepts_inputs_that_need_moving_to_the_host(
+    tmp_path: Path, embedder, tiny_source_tokenizer
+):
+    """ONNX Runtime runs on CPU, so the gate must move tensors across before converting.
+
+    Regression: it called ``.numpy()`` directly, so on an MPS build the gate crashed --
+    after training, after the fidelity gates, and after the graph had already been written.
+    A non-contiguous tensor exercises the same conversion path on CPU.
+    """
+    pytest.importorskip("onnxruntime")
+
+    from byteify.inference import export_onnx
+
+    inputs = _inputs(embedder, tiny_source_tokenizer)
+    with torch.no_grad():
+        eager = embedder(*inputs)
+
+    graph = tmp_path / "graph.onnx"
+    export_onnx(embedder, tiny_source_tokenizer, path=str(graph), max_bytes=128,
+                n_patches=8, example_batch=inputs)
+
+    # A tensor that requires a copy rather than a view.
+    awkward = tuple(t.flip(-1).flip(-1) for t in inputs)
+    report = GateReport()
+    diff = check_exported_graph(report, graph_path=graph, inputs=awkward, eager=eager,
+                                thresholds=Thresholds(onnx_max_abs_diff=1e-4))
+    assert report.passed, report.failures
+    assert diff <= 1e-4
+
+
 def test_the_graph_gate_rejects_nan_even_when_eager_agrees(
     tmp_path: Path, embedder, tiny_source_tokenizer
 ):

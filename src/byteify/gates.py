@@ -223,25 +223,29 @@ def check_exported_graph(
         return float("nan")
 
     session = ort.InferenceSession(str(graph_path), providers=["CPUExecutionProvider"])
-    got = session.run(
-        None,
-        {
-            "byte_ids": inputs[0].numpy(),
-            "expanded_ids": inputs[1].numpy(),
-            "byte_mask": inputs[2].numpy(),
-        },
-    )[0]
+    # ONNX Runtime runs on CPU and numpy needs a host tensor, so everything crossing that
+    # boundary is moved first. Without it the gate crashed on any non-CPU build -- after
+    # training, after the fidelity gates, and after the graph had been written.
+    feed = {
+        "byte_ids": inputs[0].detach().cpu().numpy(),
+        "expanded_ids": inputs[1].detach().cpu().numpy(),
+        "byte_mask": inputs[2].detach().cpu().numpy(),
+    }
+    eager_np = eager.detach().cpu().numpy()
+    got = session.run(None, feed)[0]
 
     # A graph can match eager PyTorch perfectly and still be worthless if both are NaN --
     # which is exactly what happened to artifacts exported before the masked-softmax fix.
     # Agreement with a broken reference is not agreement.
-    finite = bool(np.isfinite(got).all()) and bool(np.isfinite(eager.detach().cpu().numpy()).all())
+    finite = bool(np.isfinite(got).all()) and bool(np.isfinite(eager_np).all())
     report.add("outputs_finite", float(finite), 1.0, ">=")
     if not finite:
-        report.extra["non_finite_outputs"] = "the exported graph or the eager reference produced NaN/inf"
+        report.extra["non_finite_outputs"] = (
+            "the exported graph or the eager reference produced NaN/inf"
+        )
         return float("nan")
 
-    diff = float(np.abs(got - eager.detach().cpu().numpy()).max())
+    diff = float(np.abs(got - eager_np).max())
     report.add("onnx_max_abs_diff", diff, thresholds.onnx_max_abs_diff, "<=")
     return diff
 
