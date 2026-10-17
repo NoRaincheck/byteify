@@ -30,19 +30,19 @@ import argparse
 import json
 import math
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-from byteify.data import BatchSampler, iter_texts
+from byteify.data import BatchSampler, iter_texts, truncate_to_bytes
 from byteify.losses import boundary_loss, masked_byte_loss, sample_mlm_mask
 from byteify.model import ByteMLMHead
 from byteify.source import (
     HuggingFaceSourceEncoder,
     LocalEncoderSpec,
     build_byteified_encoder,
-    load_byteified_encoder,
 )
 from byteify.stitching import encode_texts
 
@@ -112,26 +112,36 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     source = HuggingFaceSourceEncoder(AutoModel.from_pretrained(args.model)).to(device)
 
+    # The interface's architecture comes out of the checkpoint when there is one, and out
+    # of the declared flags otherwise -- never out of constants written at this call site,
+    # which silently built a different shape for any checkpoint trained with other settings.
     if args.init:
-        # The architecture comes out of the checkpoint, not out of constants here.
-        encoder = load_byteified_encoder(args.init, source, tokenizer).to(device)
-        print(f"loaded Stage 1 from {args.init}")
+        recorded = torch.load(args.init, map_location="cpu", weights_only=False)
+        spec = LocalEncoderSpec.from_config(recorded.get("config") or recorded.get("args") or {})
+        print(f"loaded Stage 1 interface from {args.init}: {spec}")
     else:
-        encoder = build_byteified_encoder(
-            source,
-            tokenizer,
-            LocalEncoderSpec(
-                layers=1,
-                backend="attention",
-                window=128,
-                ffn_hidden=1024,
-                boundary_predictor="mlp",
-            ),
-        ).to(device)
+        spec = LocalEncoderSpec(boundary_predictor="mlp")
+        print(f"no --init given: building the byte interface fresh: {spec}")
+
+    # Stage 2 predicts masked bytes off the *output* side, so the local decoder has to
+    # exist. A Stage 1 checkpoint has none -- that model was trained without it -- so the
+    # flag decides the output side rather than the checkpoint. The rest of the interface
+    # still comes from the checkpoint, so Stage 1's learned weights are kept.
+    spec = replace(spec, out_layers=args.out_layers, out_ffn_hidden=args.out_ffn)
+
+    encoder = build_byteified_encoder(source, tokenizer, spec).to(device)
+    if args.init:
+        _, unexpected = encoder.load_state_dict(recorded["encoder"], strict=False)
+        if unexpected:
+            raise SystemExit(f"checkpoint holds weights this encoder cannot use: {sorted(unexpected)}")
         encoder.embed.load_suffix_from(source.embedding_matrix())
-        print("no --init given: local encoder initialised from source embeddings")
+    else:
         encoder.embed.load_suffix_from(source.embedding_matrix())
-        print("no --init given: initialising the suffix table from the source embeddings")
+        print("initialised the suffix table from the source embeddings")
+
+    head = ByteMLMHead(source.d_model).to(device)
+    print(f"byte interface: {spec.layers}x{spec.backend} ffn={spec.ffn_hidden} "
+          f"win={spec.window}, out_layers={spec.out_layers}")
 
     for p in source.parameters():
         p.requires_grad_(True)
@@ -142,7 +152,11 @@ def main() -> None:
         texts, tokenizer, batch_size=args.batch_size, max_bytes=args.max_bytes, seed=args.seed
     )
     eval_batches = [
-        encode_texts(texts[i * args.batch_size : (i + 1) * args.batch_size], tokenizer, device=device)
+        encode_texts(
+            [truncate_to_bytes(t, args.max_bytes) for t in texts[i * args.batch_size : (i + 1) * args.batch_size]],
+            tokenizer,
+            device=device,
+        )
         for i in range(args.eval_batches)
     ]
     print(f"data: {len(texts)} texts; out_layers={args.out_layers}; device={device}\n")
@@ -221,10 +235,28 @@ def main() -> None:
                 )
                 json.dump(history, (out_dir / "history.json").open("w"), indent=2)
                 torch.save(
-                    {"encoder": encoder.state_dict(), "head": head.state_dict(), "args": vars(args)},
+                    {
+                        "encoder": encoder.state_dict(),
+                        "head": head.state_dict(),
+                        # Stage 2 unfreezes and trains the global model, so a checkpoint
+                        # that omits it is not resumable and not loadable -- it would
+                        # silently serve a global model that was never trained.
+                        "source": source.state_dict(),
+                        "args": vars(args),
+                        "step": step,
+                    },
                     out_dir / "stage2.pt",
                 )
 
+    torch.save(
+        {
+            "encoder": encoder.state_dict(),
+            "head": head.state_dict(),
+            "source": source.state_dict(),
+            "args": vars(args),
+        },
+        out_dir / "stage2.pt",
+    )
     print(f"\nsaved {out_dir / 'stage2.pt'}; {(time.perf_counter() - t0) / 60:.1f} min")
 
 

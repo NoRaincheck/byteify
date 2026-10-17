@@ -18,7 +18,7 @@ All three families must now be lossless, or the alignment path must refuse that 
 from __future__ import annotations
 
 from byteify.alignment import align_text, discover_special_bytes
-from tests.synthetic import build_tokenizer, synthetic_corpus
+from tests.synthetic import build_tokenizer
 
 
 def _bytes_of(text: str) -> bytes:

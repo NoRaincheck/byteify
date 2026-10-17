@@ -24,7 +24,7 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 from byteify.inference import ByteifiedEmbedder, byte_ids_for_inference, export_onnx
-from byteify.manifest import export_with_manifest, from_checkpoint
+from byteify.manifest import export_with_manifest
 from byteify.source import HuggingFaceSourceEncoder, load_byteified_encoder
 
 SAMPLES = [

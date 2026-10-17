@@ -306,6 +306,12 @@ class LocalEncoderSpec:
     derived from the source model. They are recorded in a checkpoint and read back, so a
     checkpoint trained with anything other than the defaults can still be loaded: building
     the interface from defaults instead produced a different shape and failed the load.
+
+    ``out_layers``/``out_ffn_hidden`` describe the *output* side -- the depooling path and
+    the local decoder that returns contextualised representations to the byte axis. Stage 2
+    needs it to predict masked bytes, and because it adds parameters it has to travel
+    through the same spec: an encoder rebuilt without it returns ``byte_context=None``,
+    which is the shape error surfacing somewhere far from its cause.
     """
 
     layers: int = 1
@@ -314,12 +320,16 @@ class LocalEncoderSpec:
     ffn_hidden: int = 1024
     boundary_predictor: str = "mlp"
     heads: int | None = None
+    out_layers: int = 0
+    out_ffn_hidden: int = 1024
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> LocalEncoderSpec:
         """Read the spec out of a checkpoint's recorded configuration.
 
-        Reads the same key names the trainers write, so existing checkpoints load.
+        Reads the same key names the trainers write, so existing checkpoints load. Stage 1
+        checkpoints predate the output side and carry no ``out_layers``; they default to 0,
+        which is what those checkpoints were actually trained with.
         """
         return cls(
             layers=int(config.get("local_layers", 1)),
@@ -327,6 +337,8 @@ class LocalEncoderSpec:
             window=int(config.get("local_window", 128)),
             ffn_hidden=int(config.get("local_ffn", 1024)),
             boundary_predictor=str(config.get("boundary_predictor", "mlp")),
+            out_layers=int(config.get("out_layers", 0)),
+            out_ffn_hidden=int(config.get("out_ffn", 1024)),
         )
 
     def to_config(self) -> dict[str, Any]:
@@ -336,6 +348,8 @@ class LocalEncoderSpec:
             "local_window": self.window,
             "local_ffn": self.ffn_hidden,
             "boundary_predictor": self.boundary_predictor,
+            "out_layers": self.out_layers,
+            "out_ffn": self.out_ffn_hidden,
         }
 
 
@@ -368,6 +382,11 @@ def build_byteified_encoder(source: SourceEncoder, tokenizer, spec: LocalEncoder
             backend=spec.backend,
         ),
         boundary_predictor=spec.boundary_predictor,
+        local_decoder_layers=spec.out_layers,
+        local_decoder_ffn_hidden=spec.out_ffn_hidden,
+        local_decoder_window=spec.window,
+        n_heads=heads,
+        backend=spec.backend,
     )
 
 

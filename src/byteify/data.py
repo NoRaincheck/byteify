@@ -104,10 +104,20 @@ class BatchSampler:
             )
 
     def _prepare(self, text: str) -> str:
-        if self.max_bytes is None:
-            return text
-        raw = text.encode("utf-8")[: self.max_bytes]
-        return raw.decode("utf-8", errors="ignore")
+        return truncate_to_bytes(text, self.max_bytes)
+
+
+def truncate_to_bytes(text: str, max_bytes: int | None) -> str:
+    """Cut ``text`` to at most ``max_bytes`` UTF-8 bytes, on a character boundary.
+
+    One rule, so that a training batch and an evaluation batch are built from identically
+    truncated text. Truncating the training sampler but not the evaluation path meant
+    ``--max-bytes`` silently did nothing to evaluation, and the byte axis there was set by
+    whichever document happened to be longest.
+    """
+    if max_bytes is None:
+        return text
+    return text.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
 
 
 def pad_to_multiple(tensor: torch.Tensor, multiple: int) -> tuple[torch.Tensor, int]:

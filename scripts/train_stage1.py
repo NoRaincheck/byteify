@@ -26,15 +26,19 @@ from pathlib import Path
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-from byteify.data import BatchSampler, iter_texts
+from byteify.data import BatchSampler, iter_texts, truncate_to_bytes
 from byteify.losses import (
     Stage1Weights,
     boundary_loss,
     embedding_loss,
     stitching_loss,
 )
-from byteify.model import ByteifiedEncoder
-from byteify.source import ByteifyConfig, HuggingFaceSourceEncoder
+from byteify.source import (
+    ByteifyConfig,
+    HuggingFaceSourceEncoder,
+    LocalEncoderSpec,
+    build_byteified_encoder,
+)
 from byteify.stitching import encode_texts
 
 
@@ -160,7 +164,6 @@ def main() -> None:
 
     resolution = resolve_token_bytes(tokenizer)
     specials = discover_special_bytes(tokenizer)
-    n_byte_values = 256 + len(specials)
     print(
         f"source: {sum(p.numel() for p in source.parameters()) / 1e6:.2f}M params, "
         f"d_model={source.d_model}, layers={source.n_layers}, family={source.family}"
@@ -208,7 +211,7 @@ def main() -> None:
     )
     eval_batches = [
         encode_texts(
-            eval_texts[i : i + args.batch_size],
+            [truncate_to_bytes(t, args.max_bytes) for t in eval_texts[i : i + args.batch_size]],
             tokenizer,
             add_special_tokens=True,
             device=device,

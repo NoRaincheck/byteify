@@ -13,7 +13,7 @@ import statistics
 
 from transformers import AutoTokenizer
 
-from byteify.alignment import align, build_token_byte_table
+from byteify.alignment import align_text, discover_special_bytes
 
 SAMPLES = {
     "english prose": "The quick brown fox jumps over the lazy dog. " * 20,
@@ -50,13 +50,16 @@ SAMPLES = {
 
 def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained("jhu-clsp/ettin-encoder-17m")
-    table = build_token_byte_table(tokenizer)
+    # align_text picks the route the tokenizer family's offsets can actually support, so
+    # this measures the byte stream the model would really see rather than one reconstructed
+    # from offsets the byte-level tokenizer reports overlapping.
+    specials = discover_special_bytes(tokenizer)
 
     print(f"{'domain':22} {'bytes/token':>11} {'tokens/MB':>10}")
     print("-" * 47)
     rows = []
     for name, text in SAMPLES.items():
-        a = align(tokenizer(text, add_special_tokens=False)["input_ids"], table)
+        a = align_text(text, tokenizer, special_token_ids=specials, add_special_tokens=False)
         ratio = a.bytes_per_patch
         rows.append((name, ratio))
         tokens_per_mb = 1_000_000 / ratio

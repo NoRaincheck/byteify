@@ -33,10 +33,11 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
-from byteify.alignment import build_token_byte_table
-from byteify.expand import build_trie
+from byteify.alignment import discover_special_bytes
 from byteify.model import ByteifiedEncoder, LocalContextEncoder, PartialModernBert
+from byteify.source import resolve_source_encoder
 from byteify.stitching import encode_texts, masked_l2, teacher_states
+from byteify.vocab import resolve_token_bytes
 
 DEPTHS = (0, 1, 2, 4, 7)
 
@@ -203,15 +204,15 @@ def main() -> None:
     for p in source.parameters():
         p.requires_grad_(False)
 
-    table = build_token_byte_table(tokenizer)
-    trie = build_trie(table)
+    resolution = resolve_token_bytes(tokenizer)
+    specials = discover_special_bytes(tokenizer)
     partial = PartialModernBert(source)
     d_model = source.config.hidden_size
 
     encoder = ByteifiedEncoder(
         d_model=d_model,
-        n_byte_values=table.n_byte_values,
-        subword_vocab_size=len(table),
+        n_byte_values=256 + len(specials),
+        subword_vocab_size=resolution.vocab_size,
         local_encoder=LocalContextEncoder(
             d_model,
             n_layers=args.local_layers,
@@ -222,7 +223,7 @@ def main() -> None:
         ),
         boundary_predictor="mlp",
     ).to(device)
-    encoder.embed.load_suffix_from(source.embeddings.tok_embeddings.weight.data)
+    encoder.embed.load_suffix_from(resolve_source_encoder(source).embedding_matrix().data)
 
     texts = load_corpus([Path(p) for p in args.data], args.n_texts, args.max_bytes, args.seed)
 
@@ -232,11 +233,11 @@ def main() -> None:
     n_eval = max(1, len(texts) // 4)
     eval_texts, train_texts = texts[:n_eval], texts[n_eval:]
     batches = [
-        encode_texts(train_texts[i : i + args.batch_size], tokenizer, table, trie, device=device)
+        encode_texts(train_texts[i : i + args.batch_size], tokenizer, device=device)
         for i in range(0, len(train_texts), args.batch_size)
     ]
     eval_batches = [
-        encode_texts(eval_texts[i : i + args.batch_size], tokenizer, table, trie, device=device)
+        encode_texts(eval_texts[i : i + args.batch_size], tokenizer, device=device)
         for i in range(0, len(eval_texts), args.batch_size)
     ]
 

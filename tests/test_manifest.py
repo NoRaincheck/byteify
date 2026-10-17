@@ -14,7 +14,7 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 
-from byteify import GateResults, Manifest, from_checkpoint, resolve_token_bytes
+from byteify import GateResults, Manifest, from_checkpoint
 
 
 @pytest.fixture()

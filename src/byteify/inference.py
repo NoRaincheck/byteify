@@ -32,10 +32,14 @@ during *training*; for deployment these come from the byte stream alone, see
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+if TYPE_CHECKING:
+    from .manifest import Manifest
 
 
 def budgeted_patches_mask(mask: Tensor) -> Tensor:
@@ -204,20 +208,21 @@ class ByteifiedEmbedder(nn.Module):
         Returns:
             A fully-constructed ``ByteifiedEmbedder``.
         """
-        from .source import (
-            LocalEncoderSpec,
-            build_byteified_encoder,
-            HuggingFaceSourceEncoder,
-            load_byteified_encoder,
-        )
-        from transformers import AutoModel, AutoTokenizer
-
         # Resolve the checkpoint directory from the manifest.  The
         # manifest stores source_id but not the path; the convention is
         # that the checkpoint directory is named after the source_id
         # (with "/" replaced by "_").
         import os
         from pathlib import Path
+
+        from transformers import AutoModel, AutoTokenizer
+
+        from .source import (
+            HuggingFaceSourceEncoder,
+            LocalEncoderSpec,
+            build_byteified_encoder,
+            load_byteified_encoder,
+        )
 
         ckpt_dir = Path(os.path.expanduser(
             os.path.join("runs", manifest.source_id.replace("/", "_"))

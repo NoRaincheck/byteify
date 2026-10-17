@@ -47,6 +47,12 @@ from .losses import (
     sample_mlm_mask,
     stitching_loss,
 )
+from .manifest import (
+    GateResults,
+    Manifest,
+    export_with_manifest,
+    from_checkpoint,
+)
 from .model import (
     ByteEmbedding,
     ByteifiedEncoder,
@@ -81,12 +87,6 @@ from .stitching import (
 )
 from .task_arithmetic import apply_delta, delta, task_arithmetic_merge
 from .vocab import VocabByteResolution, build_suffix_trie, resolve_token_bytes
-from .manifest import (
-    GateResults,
-    Manifest,
-    from_checkpoint,
-    export_with_manifest,
-)
 
 __all__ = [
     "SPECIAL_TOKENS",
@@ -103,12 +103,14 @@ __all__ = [
     "ContrastiveHead",
     "CosineBoundaryPredictor",
     "Depooling",
+    "GateResults",
     "LocalAttention",
     "LocalContextEncoder",
     "LocalEncoderSpec",
     "LocalFeedForward",
     "LocalGRU",
     "MLPBoundaryPredictor",
+    "Manifest",
     "PartialModernBert",
     "ProjectionHead",
     "RMSNorm",
@@ -132,6 +134,8 @@ __all__ = [
     "encode_texts",
     "expand_byte_ids",
     "export_onnx",
+    "export_with_manifest",
+    "from_checkpoint",
     "infonce",
     "iter_texts",
     "load_byteified_encoder",
@@ -139,10 +143,6 @@ __all__ = [
     "masked_l2",
     "merge_batch",
     "merge_boundaries",
-    "Manifest",
-    "GateResults",
-    "from_checkpoint",
-    "export_with_manifest",
     "mine_pairs",
     "pair_batches",
     "patch_index",

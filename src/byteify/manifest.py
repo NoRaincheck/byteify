@@ -22,7 +22,6 @@ atomically (write to a temp, rename).
 from __future__ import annotations
 
 import json
-import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -201,7 +200,7 @@ def from_checkpoint(
         family = resolution.strategy if resolution else ""
     vocab_size = resolution.vocab_size if resolution else 0
     n_special = config.get("n_byte_values", 0) - 256
-    n_byte_values = 256 + (n_special if n_special > 0 else 0)
+    n_byte_values = 256 + (max(0, n_special))
 
     # Extract gate results from history if available.
     gate = None
@@ -292,12 +291,11 @@ def export_with_manifest(
     errors = manifest.validate()
     if errors:
         raise ValueError(
-            f"manifest validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
+            "manifest validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
         )
 
     # Write ONNX graph first.  On failure, manifest is NOT written.
     onnx_path = output_dir / "artifact.onnx"
-    import torch
 
     # This is the entry point — the caller builds the embedder and calls
     # export_onnx from byteify.inference.  We just save the manifest

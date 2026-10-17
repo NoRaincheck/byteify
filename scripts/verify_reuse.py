@@ -18,7 +18,7 @@ import gc
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-from byteify.alignment import align_text
+from byteify.alignment import align_text, discover_special_bytes
 from byteify.source import (
     HuggingFaceSourceEncoder,
     LocalEncoderSpec,
