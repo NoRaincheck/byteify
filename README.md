@@ -91,17 +91,27 @@ result quoted as raw cosine as unverified.
 Pointing byteify at a different embedding model is a configuration change. Verified across
 six models spanning two architectures and three tokenizer families:
 
-| model | arch | tokenizer | params |
-| --- | --- | --- | --- |
-| `jhu-clsp/ettin-encoder-17m` | ModernBERT | byte-level BPE | 16.8M |
-| `jhu-clsp/ettin-encoder-32m` | ModernBERT | byte-level BPE | 31.9M |
-| `answerdotai/ModernBERT-base` | ModernBERT | byte-level BPE | 149M |
-| `sentence-transformers/all-MiniLM-L6-v2` | BERT | WordPiece | 22.7M |
-| `bert-base-uncased` | BERT | WordPiece | 110M |
-| `xlm-roberta-base` | RoBERTa | SentencePiece | 278M |
+**Alignment is lossless for all three families**, verified byte for byte against the training
+path. That is a claim about alignment, not about quality — and it is not the same as being
+buildable. Only `jhu-clsp/ettin-encoder-17m` has published fidelity floors, so only it can be
+built today; the other five are **alignment-verified but refused by `byteify build`**,
+because fidelity numbers do not transfer between architectures and borrowing the anchor's
+would be the same error as hardcoding them.
 
-Alignment is now **lossless for all three families**, verified byte for byte against the
-training path. Two caveats that survive, and that the manifest records rather than hides:
+| model | arch | tokenizer | params | gated |
+| --- | --- | --- | --- | --- |
+| `jhu-clsp/ettin-encoder-17m` | ModernBERT | byte-level BPE | 16.8M | yes |
+| `jhu-clsp/ettin-encoder-32m` | ModernBERT | byte-level BPE | 31.9M | no |
+| `answerdotai/ModernBERT-base` | ModernBERT | byte-level BPE | 149M | no |
+| `sentence-transformers/all-MiniLM-L6-v2` | BERT | WordPiece | 22.7M | no |
+| `bert-base-uncased` | BERT | WordPiece | 110M | no |
+| `xlm-roberta-base` | RoBERTa | SentencePiece | 278M | no |
+
+To make one buildable, train it and publish its measured floors in
+[`src/byteify/assets/thresholds.json`](src/byteify/assets/thresholds.json). It is data
+precisely so that adding a model is a measurement rather than a decision.
+
+Two caveats survive, and the manifest records both rather than hiding them:
 
 - **Suffix-trie coverage varies sharply by family.** Complete for byte-level BPE; roughly
   one byte position in five uncovered for WordPiece, three in four on non-Latin script for
@@ -122,7 +132,7 @@ training path. Two caveats that survive, and that the manifest records rather th
 
 ```bash
 uv sync --extra dev --extra onnx
-HF_HUB_OFFLINE=1 uv run pytest -q      # 235 tests, offline, ~1 min
+HF_HUB_OFFLINE=1 uv run pytest -q      # 272 tests, offline, ~2 min
 uv run ruff check .
 ```
 

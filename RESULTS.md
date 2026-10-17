@@ -466,30 +466,66 @@ src/byteify/data.py            corpus loading, length-grouped batching
 src/byteify/inference.py       budgeted patching, ByteifiedEmbedder, ONNX export
 src/byteify/contrastive.py     InfoNCE, learned temperature, pair mining, retrieval metrics
 src/byteify/stitching.py       batching, teacher states, metrics
+src/byteify/bytestream.py      the declared byte-stream rule, one per tokenizer family
+src/byteify/fidelity.py        one fidelity measurement, two explicit patch-selection rules
+src/byteify/gates.py           gate checks, per-source-model thresholds as data
+src/byteify/levels.py          level -> recipe + declared checks
+src/byteify/manifest.py        the artifact contract; the only entry point
+src/byteify/loader.py          manifest-only reconstruction
+src/byteify/training.py        Stage 1, as a function rather than a script
+src/byteify/build.py           `byteify build`: train, gate, export
+src/byteify/cli.py             the command
+src/byteify/assets/thresholds.json  published fidelity floors, per source model
 
 scripts/prepare_corpus.py      materialise a corpus shard (not run; corpora are local)
-scripts/train_stage1.py        Stage 1: frozen global model, distillation
-scripts/train_stage2.py        Stage 2: end-to-end byte-level MLM
+scripts/train_stage1.py        Stage 1 as a run with a checkpoint at a chosen path
+scripts/train_stage2.py        Stage 2: end-to-end byte-level MLM (research path)
 scripts/compression_sweep.py   the efficiency experiment
 scripts/fidelity_probe.py      single-batch Stage 1 diagnostic
 scripts/verify_reuse.py        reuse check across six models
 scripts/measure_compression.py compression ratio by domain
 scripts/train_contrastive.py  contrastive fine-tuning (the retrieval objective)
-scripts/export_onnx.py         ONNX export + numerical verification against eager
+scripts/export_onnx.py         ONNX export + numerical verification, outside the command
 ```
 
 ## 12. Reproducing
 
+The product is the command. Everything a practitioner needs is in `byteify --help` and
+[the README](README.md); this section is for reproducing the *experiments* below.
+
 ```bash
-uv sync --extra dev
-HF_HUB_OFFLINE=1 uv run pytest -q
-uv run python scripts/verify_reuse.py
-uv run python scripts/measure_compression.py
-uv run python scripts/train_stage1.py --steps 2000 --n-train 4000 --out runs/stage1
-uv run python scripts/compression_sweep.py --init runs/stage1/stage1.pt
-uv run python scripts/train_stage2.py --init runs/stage1/stage1.pt --steps 2000
-uv run python scripts/train_contrastive.py --init runs/stage1/stage1.pt --steps 500
-uv run scripts/export_onnx.py --init runs/contrastive/contrastive.pt
+uv sync --extra dev --extra onnx
+HF_HUB_OFFLINE=1 uv run pytest -q          # the whole suite, offline, ~90s
+
+# the product: a gated serving artifact
+HF_HUB_OFFLINE=1 uv run byteify build \
+    --model jhu-clsp/ettin-encoder-17m --level faithful \
+    --data data/pg84.txt data/pg1342.txt data/pg2701.txt --out ./artifact \
+    --steps 6000 --batch-size 4 --max-bytes 512 --patch-budget 128
+HF_HUB_OFFLINE=1 uv run byteify encode ./artifact --text "the quick brown fox"
+
+# the measurements in this document
+HF_HUB_OFFLINE=1 uv run byteify levels
+HF_HUB_OFFLINE=1 uv run python scripts/verify_reuse.py        # section 5
+HF_HUB_OFFLINE=1 uv run python scripts/measure_compression.py # bytes/patch by domain
+HF_HUB_OFFLINE=1 uv run python scripts/compression_sweep.py --init <checkpoint.pt>
 ```
 
-`HF_HUB_OFFLINE=1` is set throughout: everything runs from the local cache and the local corpus.
+`HF_HUB_OFFLINE=1` is set throughout: everything runs from the local cache and the local
+corpus.
+
+### The scripts are research scaffolding, not the interface
+
+`scripts/` holds the experiments this document reports. Each one either calls the same code
+path as the command or is a measurement the command does not make; none of them is part of
+the documented surface, and `scripts/train_stage1.py` now delegates to
+`byteify.training.train_stage1` so the two cannot drift into training different things.
+
+Five of them were broken when this work started — three raised `NameError` because a
+refactor moved symbols without updating the callers, and two failed at import on a removed
+function. `ruff` had been reporting all of them as `F821`/`F401` for some time; nothing ran
+it. They are fixed and `ruff check .` is clean.
+
+Stage 2 and the contrastive trainer remain research paths. `scripts/train_stage2.py` is not
+reachable from `byteify --level`, because Stage 2 trains the global model away from the
+source model, which is what the fidelity guarantee forbids (ADR 0007, ADR 0009).
