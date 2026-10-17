@@ -2,51 +2,11 @@
   "jhu-clsp/ettin-encoder-17m": {
     "source_id": "jhu-clsp/ettin-encoder-17m",
     "architecture": "modernbert",
-    "cos_emb_c": 0.85,
-    "sim_corr": 0.80,
-    "boundary_acc": 0.95,
+    "cos_emb_c": 0.75,
+    "sim_corr": 0.60,
+    "boundary_acc": 0.90,
     "onnx_max_abs_diff": 1e-4,
     "trie_coverage": 0.99,
-    "note": "Measured floors from runs/stage1 (4000 steps, 16.8M source, byte-level BPE). Observed at that run: cos_emb_c 0.90, sim_corr 0.89, boundary_acc 0.990, nn_agree 0.31 against a 0.008 chance rate. Set below the observed values so a modestly worse rerun still ships, and far above the randomly-initialised interface's cos -0.008 / sim_corr 0.145 / boundary 0.000."
-  },
-  "jhu-clsp/ettin-encoder-32m": {
-    "source_id": "jhu-clsp/ettin-encoder-32m",
-    "architecture": "modernbert",
-    "cos_emb_c": 0.85,
-    "sim_corr": 0.80,
-    "boundary_acc": 0.95,
-    "onnx_max_abs_diff": 1e-4,
-    "trie_coverage": 0.99,
-    "note": "Same family and tokenizer as the 17m anchor. Bounds are the anchor's, not measured on this model; treat them as a starting point to be replaced by a measurement."
-  },
-  "sentence-transformers/all-MiniLM-L6-v2": {
-    "source_id": "sentence-transformers/all-MiniLM-L6-v2",
-    "architecture": "bert",
-    "cos_emb_c": 0.80,
-    "sim_corr": 0.75,
-    "boundary_acc": 0.90,
-    "onnx_max_abs_diff": 1e-4,
-    "trie_coverage": 0.0,
-    "note": "WordPiece, and an uncased one. Roughly one byte position in five is not covered by the suffix trie, and the tokenizer's normaliser rewrites text, so this artifact is materially weaker than a byte-level one. Coverage is not gated."
-  },
-  "bert-base-uncased": {
-    "source_id": "bert-base-uncased",
-    "architecture": "bert",
-    "cos_emb_c": 0.80,
-    "sim_corr": 0.75,
-    "boundary_acc": 0.90,
-    "onnx_max_abs_diff": 1e-4,
-    "trie_coverage": 0.0,
-    "note": "WordPiece, uncased. Same caveats as all-MiniLM-L6-v2."
-  },
-  "xlm-roberta-base": {
-    "source_id": "xlm-roberta-base",
-    "architecture": "bert",
-    "cos_emb_c": 0.80,
-    "sim_corr": 0.75,
-    "boundary_acc": 0.90,
-    "onnx_max_abs_diff": 1e-4,
-    "trie_coverage": 0.0,
-    "note": "SentencePiece. About three byte positions in four are uncovered by the suffix trie on non-Latin script."
+    "note": "Measured 2026-10-17 on the gate's own metric: budgeted patching, 512-byte axis, patch budget 128, 6000 Stage 1 steps on three Project Gutenberg books. Observed cos_emb_c 0.841, sim_corr 0.717, boundary_acc 0.944, trie coverage 1.00. Floors sit below those so a modestly worse rerun still ships, and far above a randomly initialised byte interface's cos -0.005 / sim_corr 0.241 / boundary 0.228 -- which exports cleanly and passes every check except this one. No other source model has published floors: the other five verified models are alignment-verified (see README, Reusability) but have never been gated, and fidelity numbers do not transfer between architectures, so they are refused rather than guessed."
   }
 }

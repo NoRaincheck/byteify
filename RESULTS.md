@@ -205,6 +205,14 @@ in all six**:
 | bert-base-uncased | — | wordpiece | — | — | 3.34 | 32 | yes |
 | xlm-roberta-base | — | sentencepiece | — | — | 2.90 | 32 | yes |
 
+**What this table does and does not say.** It says alignment is lossless across all three
+tokenizer families. It does **not** say six gated, level-1 artifacts exist. `byteify` has
+published fidelity floors for exactly one source model — `jhu-clsp/ettin-encoder-17m`, at
+cos_emb_c 0.75, sim_corr 0.60, boundary_acc 0.90 — and refuses the other five with a
+message saying so, because fidelity numbers do not transfer between architectures and
+borrowing them would be the same error as hardcoding them. Turning a verified model into a
+gateable one means training it and publishing its measured floors; see issue #15.
+
 Three defects surfaced while doing this, each of which would have silently corrupted training:
 
 1. **HF offsets are untrustworthy for byte-level BPE with multi-byte characters.** For
@@ -251,6 +259,46 @@ property rather than a workaround:
 A side consequence: **per-patch comparison against the token axis is only defined while
 patches and tokens correspond one-to-one**, which is why `cos@L` in the compression sweep is
 reported as NaN above the tokenizer's own ratio.
+
+### Budgeted patching costs real fidelity, and it is not free to ignore
+
+The fidelity numbers elsewhere in this document — including §4.1's headline — are measured
+under **oracle subword boundaries**. That is the right measurement for Stage 1's losses,
+which pool with the true boundaries so the student's patch axis stays aligned with the
+teacher's token axis. It is the *wrong* measurement for a serving artifact, which always
+uses budgeted patching.
+
+Both numbers are true. They are not the same claim.
+
+Same checkpoint (6000 Stage 1 steps, 512-byte axis), only the patch budget varying:
+
+| patch budget | implied bytes/patch | cos_emb_c | sim_corr | boundary_acc |
+| --- | --- | --- | --- | --- |
+| 64 | 8.0 | 0.585 | 0.441 | 0.9362 |
+| **128** | **4.0** | **0.795** | **0.656** | **0.9362** |
+| 192 | 2.7 | 0.783 | 0.630 | 0.9362 |
+| 256 | 2.0 | 0.762 | 0.610 | 0.9362 |
+
+(measured at 1500 steps; the shape is what matters here, not the absolute level)
+
+Read across: the budget is not a free parameter. Too few merges patches and costs ~0.21
+centred cosine; too many masks surplus slots and costs back some of it. `byteify` therefore
+derives the budget from the byte axis at Bolmo's ~4 bytes per patch and **warns** when a
+chosen budget does not fit.
+
+At the fitted budget and a 6000-step run, the gate's own metric — budgeted patching, 128
+patches, 512 bytes — reads:
+
+| metric | oracle boundaries | budgeted (what the artifact does) |
+| --- | --- | --- |
+| `cos_emb_c` | 0.940 | **0.841** |
+| `sim_corr` | 0.912 | **0.717** |
+| `boundary_acc` | 0.944 | 0.944 |
+
+Boundary accuracy is unchanged, because it does not depend on how patches are chosen — only
+the pooled representation does. Those budgeted numbers, not the oracle ones, are what
+`byteify/assets/thresholds.json` publishes, and they are why the thresholds had to be
+re-measured rather than copied forward from §4.1.
 
 ### Verified numerically, not just exported
 

@@ -110,21 +110,36 @@ def test_an_unknown_source_model_is_refused_with_a_reason():
     assert "thresholds.json" in message
 
 
-def test_the_published_models_span_all_three_tokenizer_families():
-    """The floors must exist for families byteify claims to support."""
-    import json as _json
+def test_only_measured_source_models_have_published_floors():
+    """A model that has never been gated must be refused, not guessed at.
 
-    raw = _json.loads(
-        (
-            Path(__file__).parent.parent
-            / "src"
-            / "byteify"
-            / "assets"
-            / "thresholds.json"
-        ).read_text("utf-8")
-    )
-    assert len(raw) == len(published_source_ids())
-    assert {"bert-base-uncased", "xlm-roberta-base", "jhu-clsp/ettin-encoder-17m"} <= set(raw)
+    Five of the six verified models are alignment-verified but have never had their
+    fidelity measured on this metric. Publishing numbers for them would be borrowing
+    someone else's floors across architectures, which is the thing per-model thresholds
+    exist to prevent.
+    """
+    assert published_source_ids() == ["jhu-clsp/ettin-encoder-17m"]
+    for model_id in (
+        "sentence-transformers/all-MiniLM-L6-v2",
+        "bert-base-uncased",
+        "xlm-roberta-base",
+        "jhu-clsp/ettin-encoder-32m",
+        "answerdotai/ModernBERT-base",
+    ):
+        with pytest.raises(KeyError):
+            thresholds_for(model_id)
+
+
+def test_the_anchor_floors_sit_below_what_was_observed_and_above_a_random_interface():
+    """The floors have to be reachable by a real run and unreachable by an untrained one."""
+    observed = {"cos_emb_c": 0.841, "sim_corr": 0.717, "boundary_acc": 0.944}
+    untrained = {"cos_emb_c": -0.005, "sim_corr": 0.241, "boundary_acc": 0.228}
+    thresholds = thresholds_for("jhu-clsp/ettin-encoder-17m")
+
+    for name, measured in observed.items():
+        floor = getattr(thresholds, name)
+        assert floor < measured, f"{name} floor {floor} is above the observed {measured}"
+        assert floor > untrained[name], f"{name} floor {floor} would admit an untrained model"
 
 
 # -- a gate that fails fails ----------------------------------------------
