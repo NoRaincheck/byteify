@@ -318,6 +318,34 @@ def test_the_exported_graph_gate_catches_a_graph_that_computes_something_else(
     assert not wrong.passed
 
 
+def test_the_graph_gate_rejects_nan_even_when_eager_agrees(
+    tmp_path: Path, embedder, tiny_source_tokenizer
+):
+    """Agreement with a NaN reference is not agreement.
+
+    Regression: artifacts exported before the masked-softmax fix returned NaN for every
+    input, and would have passed a pure numerical-agreement gate if eager had produced the
+    same NaN. Finiteness is its own check for that reason.
+    """
+    pytest.importorskip("onnxruntime")
+
+    from byteify.inference import export_onnx
+
+    inputs = _inputs(embedder, tiny_source_tokenizer)
+    with torch.no_grad():
+        eager = embedder(*inputs)
+
+    graph = tmp_path / "graph.onnx"
+    export_onnx(embedder, tiny_source_tokenizer, path=str(graph), max_bytes=128,
+                n_patches=8, example_batch=inputs)
+
+    report = GateReport()
+    check_exported_graph(report, graph_path=graph, inputs=inputs,
+                         eager=eager * float("nan"), thresholds=Thresholds())
+    assert not report.passed
+    assert {c.name for c in report.failures} >= {"outputs_finite"}
+
+
 def _inputs(embedder, tokenizer) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     from byteify.alignment import discover_special_bytes

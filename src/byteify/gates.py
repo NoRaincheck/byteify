@@ -209,6 +209,10 @@ def check_exported_graph(
 
     Prior art in this repository and the model for the numerical gate: an artifact that
     loads but computes something else is useless, and nothing downstream would notice.
+
+    Finiteness is checked first and separately. A graph can agree with eager PyTorch to
+    1e-7 and both be NaN -- which is precisely what artifacts exported before the masked
+    softmax fix did. Agreement with a broken reference is not agreement.
     """
     import numpy as np
 
@@ -227,6 +231,16 @@ def check_exported_graph(
             "byte_mask": inputs[2].numpy(),
         },
     )[0]
+
+    # A graph can match eager PyTorch perfectly and still be worthless if both are NaN --
+    # which is exactly what happened to artifacts exported before the masked-softmax fix.
+    # Agreement with a broken reference is not agreement.
+    finite = bool(np.isfinite(got).all()) and bool(np.isfinite(eager.detach().cpu().numpy()).all())
+    report.add("outputs_finite", float(finite), 1.0, ">=")
+    if not finite:
+        report.extra["non_finite_outputs"] = "the exported graph or the eager reference produced NaN/inf"
+        return float("nan")
+
     diff = float(np.abs(got - eager.detach().cpu().numpy()).max())
     report.add("onnx_max_abs_diff", diff, thresholds.onnx_max_abs_diff, "<=")
     return diff
