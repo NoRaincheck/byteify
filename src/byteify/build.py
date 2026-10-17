@@ -241,6 +241,14 @@ def build_artifact(
     # -- 4. export ------------------------------------------------------------
     say()
     say("exporting")
+
+    # The graph is traced at, and then verified against, the same inputs. Built here and
+    # moved onto the model's device: `export_onnx` would otherwise build its own example on
+    # CPU, and the dynamo exporter rejects a graph with tensors on two devices.
+    graph_inputs = _example_inputs(
+        rule, trie, coverage_texts[:batch_size], max_bytes
+    ).to(device)
+
     manifest = export_artifact(
         embedder,
         tokenizer,
@@ -251,16 +259,12 @@ def build_artifact(
         source_revision=getattr(source, "revision", "") or "",
         coverage_texts=coverage_texts,
         gate=None,
+        example_batch=graph_inputs,
     )
 
-    # The numerical gate runs against the graph that was just written, and the result goes
-    # into the manifest, so the artifact records what it was checked against.
-    graph_inputs = _example_inputs(embedder, rule, trie, coverage_texts[:batch_size], max_bytes)
-    with torch.no_grad():
-        eager = embedder(*graph_inputs)
     diff = check_exported_graph(
         report, graph_path=output_dir / "artifact.onnx", inputs=graph_inputs,
-        eager=eager, thresholds=thresholds,
+        eager=_eager(embedder, graph_inputs), thresholds=thresholds,
     )
     if not report.passed:
         # Remove the whole directory: a graph without a passing gate is not an artifact.
@@ -321,8 +325,22 @@ def _fit_patch_budget(
     return patch_budget
 
 
-def _example_inputs(embedder, rule, trie, texts: list[str], width: int):
-    """One padded batch of the graph's three inputs, built with no tokenizer."""
+def _eager(embedder, inputs):
+    """The eager result the exported graph is compared against."""
+    import torch
+
+    with torch.no_grad():
+        return embedder(*inputs)
+
+
+def _example_inputs(rule, trie, texts: list[str], width: int):
+    """One padded batch of the graph's three inputs, built with no tokenizer.
+
+    The byte mask comes from each stream's own length rather than from the byte values. A
+    zero *value* is a real byte -- NUL appears in binary-ish text -- so inferring the mask
+    from ``byte_ids != 0`` would silently drop real positions, and the gate would then be
+    measuring a graph fed a corrupted mask.
+    """
     import torch
     import torch.nn.functional as F
 
@@ -331,18 +349,18 @@ def _example_inputs(embedder, rule, trie, texts: list[str], width: int):
     rows = []
     for text in texts:
         byte_ids = rule.build(text, width)
-        rows.append((byte_ids, expand_byte_ids(byte_ids, trie, pseudo_byte_to_token=rule.pseudo_bytes)))
-    target = width
+        expanded = expand_byte_ids(
+            byte_ids, trie, pseudo_byte_to_token=rule.pseudo_bytes
+        )
+        rows.append((byte_ids, expanded))
+
     byte_ids = torch.stack(
-        [F.pad(torch.tensor(r[0]), (0, target - len(r[0]))) for r in rows]
+        [F.pad(torch.tensor(ids), (0, width - len(ids))) for ids, _ in rows]
     )
     expanded = torch.stack(
-        [F.pad(torch.tensor(r[1]), (0, target - len(r[1])), value=-1) for r in rows]
+        [F.pad(torch.tensor(exp), (0, width - len(exp)), value=-1) for _, exp in rows]
     )
-    mask = (byte_ids != 0).long()
-    mask[:, 0] = 1  # the opening pseudo-byte is a real position, not padding
+    mask = torch.stack(
+        [F.pad(torch.ones(len(ids), dtype=torch.long), (0, width - len(ids))) for ids, _ in rows]
+    )
     return byte_ids, expanded, mask
-
-
-def _resumable(output_dir: Path) -> bool:
-    return False

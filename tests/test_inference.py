@@ -14,6 +14,34 @@ from byteify.model import ByteifiedEncoder, LocalContextEncoder
 torch.manual_seed(0)
 
 
+def test_a_nul_byte_is_a_real_position_not_padding():
+    """A zero *value* is a real byte. Inferring the mask from values drops it.
+
+    Regression: the export path built its byte mask as ``byte_ids != 0``, so any text
+    containing NUL lost those positions from the mask -- and the gate that verified the
+    exported graph was then measuring a graph fed a corrupted mask. The mask is the
+    stream's own length now.
+    """
+    from byteify.build import _example_inputs
+    from byteify.bytestream import rule_for_family
+    from byteify.expand import ByteTrie
+
+    rule = rule_for_family("bytelevel", n_byte_values=258,
+                           special_tokens={0: 256, 1: 257})
+    trie = ByteTrie({0: b"\x00", 1: b"a"})
+    text = "a\x00\x00b"
+
+    stream = rule.build(text, 32)
+    byte_ids, expanded, mask = _example_inputs(rule, trie, [text], 32)
+
+    assert byte_ids.shape == expanded.shape == mask.shape == (1, 32)
+    assert 0 in stream, "the fixture must actually contain a NUL"
+    # Every real position is masked, including the NULs, and nothing past the stream is.
+    assert mask[0, : len(stream)].tolist() == [1] * len(stream)
+    assert mask[0, len(stream) :].tolist() == [0] * (32 - len(stream))
+    assert byte_ids[0, : len(stream)].tolist() == stream
+
+
 def test_budgeted_patches_have_static_length():
     """The whole point: the patch axis cannot depend on the input."""
     probs = torch.rand(3, 64)

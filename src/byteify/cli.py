@@ -169,21 +169,24 @@ def _onnx_inputs(manifest, artifact: Path, text: str, args: argparse.Namespace) 
     rule = manifest.stream_rule()
     trie = ByteTrie(read_trie(artifact / manifest.trie.path))
     byte_ids = rule.build(text, args.max_bytes or manifest.max_bytes)
-    expanded = expand_byte_ids(
-        byte_ids, trie, pseudo_byte_to_token=rule.pseudo_bytes
-    )
+    expanded = expand_byte_ids(byte_ids, trie, pseudo_byte_to_token=rule.pseudo_bytes)
     width = manifest.max_bytes
     if len(byte_ids) > width:
         raise ValueError(
-            f"text needs {len(byte_ids)} bytes but the artifact's byte axis is {width}; "
-            "this artifact was built with --max-bytes "
-            f"{manifest.max_bytes} and cannot take longer input"
+            f"text needs {len(byte_ids)} bytes but the artifact's byte axis is {width}. "
+            f"This artifact was built with --max-bytes {width} and cannot take longer "
+            f"input; rebuild it with a larger axis rather than have text truncated."
         )
 
     def pad(values, fill):
-        return np.pad(np.array([values], dtype=np.int64), ((0, 0), (0, width - len(values))),
-                      constant_values=fill)
+        return np.pad(
+            np.array([values], dtype=np.int64),
+            ((0, 0), (0, width - len(values))),
+            constant_values=fill,
+        )
 
+    # The mask is the stream's own length. A zero *value* is a real byte -- NUL occurs in
+    # real text -- so it cannot be used to infer which positions are padding.
     return {
         "byte_ids": pad(byte_ids, 0),
         "expanded_ids": pad(expanded, -1),
