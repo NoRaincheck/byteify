@@ -233,18 +233,100 @@ def load_reference_texts(paths: list[str], *, min_chars: int = 64, limit: int | 
     return list(iter_texts(paths, min_chars=min_chars, limit=limit))
 
 
-def load_judgements(path: str | None) -> dict[str, str] | None:
-    """Optional relevance judgements: ``{"query": "doc-id"}`` per line, or a query map."""
+@dataclass(frozen=True, slots=True)
+class Judgements:
+    """Relevance judgements as a list of decisions, each with its own candidate pool.
+
+    Candidate-pool-per-query, rather than one global pool of documents, because that is
+    what a retrieval evaluation needs to mean. Given a query, which of *these* candidates
+    answers it -- that is a decision a practitioner can act on and a model can be graded
+    on. Pooling every document in the corpus behind every query measures something else,
+    and its chance level depends on how large the corpus happens to be, which makes the
+    number impossible to compare between two artifacts fitted to different corpora.
+
+    Accepts two row shapes, both of which have existed here:
+
+    * ``{"query": q, "candidates": [...], "positive": i or text}`` -- a candidate pool.
+    * ``{"query": q, "positive": doc}`` -- one document, which is a pool of one. It is
+      accepted so an existing two-field file keeps working; every metric over it is
+      trivially perfect, which is why it is a convenience and not the format to write.
+    """
+
+    queries: list[str] = field(default_factory=list)
+    candidates: list[list[str]] = field(default_factory=list)
+    #: Candidate indices that answer each query. Indices, not texts, because the same
+    #: document can legitimately be relevant to two different queries.
+    relevant: list[list[int]] = field(default_factory=list)
+
+    def __len__(self) -> int:
+        return len(self.queries)
+
+    @property
+    def candidate_counts(self) -> list[int]:
+        return [len(pool) for pool in self.candidates]
+
+    @property
+    def chance_recall_at_1(self) -> float:
+        """What a random ranker scores, averaged over the decisions' own pool sizes."""
+        counts = self.candidate_counts
+        return sum(1.0 / max(n, 1) for n in counts) / max(len(counts), 1)
+
+
+def load_judgements(path: str | None) -> Judgements | None:
+    """Read judgements from a ``.json`` or ``.jsonl`` file; ``None`` when none was given.
+
+    A row that names no correct candidate, or names one that is not in its own pool, is
+    dropped rather than repaired. The alternative -- treating it as the first candidate,
+    or searching the pool for a near match -- would put a number on a label nobody
+    supplied, and that number would then gate a build.
+    """
     if path is None:
         return None
+
     raw = Path(path).read_text(encoding="utf-8")
+    rows: list[dict] = []
     if path.endswith(".jsonl"):
-        return {json.loads(line)["query"]: json.loads(line)["positive"]
-                for line in raw.splitlines() if line.strip()}
-    data = json.loads(raw)
-    if isinstance(data, dict):
-        return {q: v["positive"] if isinstance(v, dict) else v for q, v in data.items()}
-    return None
+        rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    else:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            rows = [
+                {"query": q, "positive": v["positive"] if isinstance(v, dict) else v}
+                for q, v in data.items()
+            ]
+        elif isinstance(data, list):
+            rows = data
+
+    queries: list[str] = []
+    pools: list[list[str]] = []
+    relevant: list[list[int]] = []
+    for row in rows:
+        query = row.get("query")
+        positive = row.get("positive")
+        pool = list(row.get("candidates") or [])
+        if not query or positive is None:
+            continue
+        if not pool:
+            pool = [str(positive)]
+        if isinstance(positive, int):
+            index = positive
+            if not 0 <= index < len(pool):
+                continue
+        else:
+            matches = [i for i, candidate in enumerate(pool) if candidate == positive]
+            if not matches:
+                continue
+            index = matches[0]
+        queries.append(query)
+        pools.append(pool)
+        relevant.append([index])
+
+    if not queries:
+        raise ValueError(
+            f"{path} yielded no usable judgements; each row needs a query and a positive "
+            "that appears among that query's candidates"
+        )
+    return Judgements(queries=queries, candidates=pools, relevant=relevant)
 
 
 def save_checkpoint(path: Path, state_dict: dict, config: dict, *, step: int | None = None) -> None:

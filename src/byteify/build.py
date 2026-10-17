@@ -27,6 +27,8 @@ from .gates import (
     check_exported_graph,
     check_fidelity,
     check_lossless_byte_stream,
+    check_retrieval,
+    require_retrieval_floor,
     thresholds_for,
 )
 from .levels import declare, resolve_level
@@ -35,6 +37,12 @@ from .manifest import GateResults, Manifest, export_artifact, measure_trie_cover
 #: Bolmo's compression ratio on English prose. Used to fit a patch budget to a byte axis;
 #: see `_fit_patch_budget`.
 TARGET_BYTES_PER_PATCH = 4.0
+
+#: Held-out texts the fidelity gate grades on. Sixteen is not enough: the centred cosine of
+#: the same Stage 1 checkpoint moved between 0.66 and 0.89 across two sixteen-text slices of
+#: the same corpus, so a gate that size reports the slice it drew rather than the artifact.
+#: Sixty-four holds to about 0.01 and costs a couple of seconds.
+GATE_TEXTS = 64
 
 
 def build_artifact(
@@ -60,19 +68,26 @@ def build_artifact(
 ) -> Manifest:
     """Produce a byteified artifact, or raise. Never returns a failed one."""
     import torch
-    from transformers import AutoTokenizer
 
     from .alignment import discover_special_bytes
     from .data import truncate_to_bytes
+    from .hub import resolve_source_model, resolve_source_tokenizer
     from .inference import ByteifiedEmbedder
     from .source import (
+        HuggingFaceSourceEncoder,
         LocalEncoderSpec,
         build_byteified_encoder,
         load_encoder_state,
         resolve_source_encoder,
     )
     from .stitching import encode_texts
-    from .training import Stage1Config, load_reference_texts, save_checkpoint, train_stage1
+    from .training import (
+        Stage1Config,
+        load_judgements,
+        load_reference_texts,
+        save_checkpoint,
+        train_stage1,
+    )
     from .vocab import resolve_token_bytes
 
     def say(message: str = "") -> None:
@@ -90,11 +105,19 @@ def build_artifact(
             f"reference data yielded {len(texts)} usable texts; at least 64 are needed to "
             "hold some out for evaluation"
         )
-    if chosen.needs_judgements and judgements is None:
+    graded = load_judgements(judgements)
+    if chosen.needs_judgements and graded is None:
         say(
             f"note: no --judgements given, so level `{chosen.name}` will not gate on "
             "retrieval. Its other guarantees are unaffected."
         )
+    if graded is not None:
+        # Refused here, in seconds, rather than after training: the whole point of
+        # supplying judgements is that the retrieval check can fail, and it cannot fail
+        # against a floor nobody published.
+        require_retrieval_floor(model, thresholds)
+        say(f"  judgements  {len(graded)} decisions from {judgements}, "
+            f"chance recall@1 {graded.chance_recall_at_1:.3f}")
     if chosen.index >= 3 and delta_from is None:
         raise ValueError(
             f"level `{chosen.name}` needs --delta-from: a post-trained variant of "
@@ -139,8 +162,18 @@ def build_artifact(
     torch.manual_seed(seed)
     device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
 
-    tokenizer = AutoTokenizer.from_pretrained(model)
-    source = resolve_source_encoder(model).to(device)
+    # Weights and vocabulary resolve through the same route, for the same reason: a build
+    # that read the encoder from one layout and the vocabulary from another would train a
+    # byte interface against a byte stream its own tokenizer does not produce.
+    tokenizer = resolve_source_tokenizer(model)
+    resolved = resolve_source_model(model)
+    source = HuggingFaceSourceEncoder(resolved.model, model_id=model, layout=resolved.layout)
+    if resolved.layout != "checkpoint":
+        say(f"  source layout: {resolved.layout} ({resolved.module_path})")
+    if resolved.dropped:
+        say(f"  {len(resolved.dropped)} checkpoint tensor(s) are not encoder weights and "
+            f"were not loaded: {sorted(resolved.dropped)[:4]}")
+    source = source.to(device)
     source.eval()
     for parameter in source.parameters():
         parameter.requires_grad_(False)
@@ -204,10 +237,12 @@ def build_artifact(
         resolution.strategy, n_byte_values=256 + len(specials), special_tokens=specials
     )
     token_bytes = {i: b for i, b in enumerate(resolution.token_bytes) if b}
-    coverage_texts = [truncate_to_bytes(t, max_bytes) for t in texts[:64]]
+    # One slice, two uses: trie coverage and the fidelity gate grade the same held-out
+    # texts, so the count is written once. Two literals that have to agree, and a gate that
+    # quietly graded fewer texts than it promised, is what that invites.
+    coverage_texts = [truncate_to_bytes(t, max_bytes) for t in texts[:GATE_TEXTS]]
     coverage = measure_trie_coverage(token_bytes, coverage_texts)
-
-    gate_texts = [t for t in coverage_texts[:16]]
+    gate_texts = coverage_texts
     check_lossless_byte_stream(report, tokenizer=tokenizer, rule=rule, texts=gate_texts)
 
     embedder = ByteifiedEmbedder(
@@ -228,6 +263,24 @@ def build_artifact(
         report, embedder=embedder, source=source, batches=gate_batches, thresholds=thresholds
     )
     check_coverage(report, coverage, thresholds)
+
+    retrieval = None
+    if chosen.index >= 2 and graded is not None:
+        # Level 2's own guarantee, on texts the artifact was not fitted on: the
+        # judgements carry their queries and candidate pools, and Stage 1 and the
+        # contrastive stage never saw them unless the caller passed them as --data too.
+        # Grading on the training corpus would measure memorisation and call it retrieval.
+        say(f"\nlevel 2: retrieval over {len(graded)} supplied judgements")
+        retrieval = check_retrieval(
+            report,
+            embed=lambda texts: embedder.encode(tokenizer, texts, max_bytes=max_bytes),
+            judgements=graded,
+            thresholds=thresholds,
+            batch_size=batch_size,
+        )
+        say(f"  decisions {retrieval['n_decisions']}, "
+            f"recall@1 {retrieval['recall@1']:.3f} against chance "
+            f"{retrieval['chance_recall_at_1']:.3f}, MRR {retrieval['mrr']:.3f}")
 
     say()
     say("gates")
@@ -280,6 +333,8 @@ def build_artifact(
         **declare(chosen, thresholds, report.extra.get("fidelity", metrics)),
         "fidelity": report.extra.get("fidelity", {}),
         "byte_stream_mismatches": report.extra.get("byte_stream_mismatches"),
+        "retrieval": None if retrieval is None else retrieval["recall@1"],
+        "retrieval_detail": retrieval or {},
     })
     manifest = Manifest.from_dict({**manifest.to_dict(), "gate": recorded.to_dict()})
     manifest.write_to(output_dir / "manifest.json")

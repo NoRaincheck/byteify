@@ -1,0 +1,30 @@
+{
+  "model": "hotchpotch/bekko-system-one-v0-17m",
+  "data": [
+    "data/corpus/open-jev-train.jsonl"
+  ],
+  "steps": 6000,
+  "batch_size": 4,
+  "max_bytes": 512,
+  "lr": 0.0003,
+  "weight_decay": 0.1,
+  "warmup": 100,
+  "stitch_depth": -1,
+  "lambda_b": 4.0,
+  "lambda_emb": 1.0,
+  "lambda_e": 1.0,
+  "eval_every": 1000,
+  "eval_batches": 4,
+  "eval_texts": 256,
+  "n_train": 4000,
+  "local_layers": 1,
+  "local_backend": "attention",
+  "local_window": 128,
+  "local_ffn": 1024,
+  "boundary_predictor": "mlp",
+  "grad_clip": 1.0,
+  "seed": 0,
+  "device": "mps",
+  "out": "runs/stage1_bekko",
+  "log_every": 50
+}

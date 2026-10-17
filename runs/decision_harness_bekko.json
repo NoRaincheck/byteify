@@ -1,0 +1,45 @@
+{
+  "all": {
+    "agreement": 0.54,
+    "byteified": 0.32666666666666666,
+    "chance": 0.4275171957671958,
+    "mean_tv": 0.26701120977635573,
+    "source": 0.6066666666666667,
+    "source_at_axis": 0.5533333333333333
+  },
+  "artifact": "artifacts/bekko-17m-faithful",
+  "axis": 512,
+  "budget": 128,
+  "decisions": 150,
+  "per_kind": {
+    "choice": {
+      "agreement": 0.21621621621621623,
+      "byteified": 0.2702702702702703,
+      "chance": 0.3232679107679108,
+      "mean_tv": 0.259436756930258,
+      "n": 37,
+      "source": 0.6216216216216216,
+      "source_at_axis": 0.5945945945945946
+    },
+    "noul": {
+      "agreement": 0.7473684210526316,
+      "byteified": 0.4,
+      "chance": 0.5,
+      "mean_tv": 0.22752699289020412,
+      "n": 95,
+      "source": 0.5684210526315789,
+      "source_at_axis": 0.5052631578947369
+    },
+    "score": {
+      "agreement": 0.1111111111111111,
+      "byteified": 0.05555555555555555,
+      "chance": 0.2592592592592593,
+      "mean_tv": 0.4909698408591345,
+      "n": 18,
+      "source": 0.7777777777777778,
+      "source_at_axis": 0.7222222222222222
+    }
+  },
+  "reference_gap": 1.484147428343352e-06,
+  "source_id": "hotchpotch/bekko-system-one-v0-17m"
+}

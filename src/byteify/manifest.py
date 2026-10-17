@@ -122,6 +122,10 @@ class GateResults:
     onnx_max_abs_diff: float | None = None
     outputs_finite: float | None = None
     retrieval: float | None = None
+    #: The retrieval measurement behind ``retrieval``: decisions graded, chance, MRR,
+    #: nDCG. Separate from the single gated number because recall@1 alone does not say
+    #: whether a corpus was easy, and chance is what says that.
+    retrieval_detail: dict[str, Any] = field(default_factory=dict)
     byte_stream_mismatches: int | None = None
     checks: dict[str, float] = field(default_factory=dict)
     thresholds: dict[str, float] = field(default_factory=dict)

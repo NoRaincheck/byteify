@@ -206,10 +206,11 @@ class ByteifiedEmbedder(nn.Module):
         """Embed text directly. Requires an artifact-loaded embedder, not a tokenizer."""
         rows = [self.inputs_for_text(t, max_bytes) for t in texts]
         width = max(int(ids.shape[1]) for ids, _, _ in rows)
+        device = _device_of(self)
 
         def pad(tensors: list[Tensor], value: int) -> Tensor:
             return torch.cat(
-                [F.pad(t, (0, width - t.shape[1]), value=value) for t in tensors], dim=0
+                [F.pad(t.to(device), (0, width - t.shape[1]), value=value) for t in tensors], dim=0
             )
 
         return self.forward(
@@ -230,9 +231,13 @@ class ByteifiedEmbedder(nn.Module):
         """Convenience path that also builds the byte inputs from a tokenizer."""
         rows = [byte_ids_for_inference(tokenizer, text, max_bytes) for text in texts]
         width = max(ids.shape[1] for ids, _, _ in rows)
+        # The inputs are built from Python integers on the host, so on any device other
+        # than CPU the first op is handed a CPU tensor and the call dies with an opaque
+        # device mismatch. Move them to where the encoder already is.
+        device = _device_of(self)
 
         def pad(tensors: list[Tensor], value: int) -> Tensor:
-            padded = [F.pad(t, (0, width - t.shape[1]), value=value) for t in tensors]
+            padded = [F.pad(t.to(device), (0, width - t.shape[1]), value=value) for t in tensors]
             # Each row already carries its batch axis, so these concatenate rather than
             # stack -- stacking would add a spurious dimension and shift every axis.
             return torch.cat(padded, dim=0)
@@ -266,6 +271,14 @@ class ByteifiedEmbedder(nn.Module):
         artifact_dir = Path(artifact_dir)
         manifest = Manifest.load(artifact_dir)
         return manifest, build_embedder_from_manifest(manifest, artifact_dir, device=device)
+
+
+def _device_of(module: nn.Module) -> torch.device:
+    """The device a module's parameters live on, for moving host-built inputs onto it."""
+    try:
+        return next(module.parameters()).device
+    except StopIteration:  # pragma: no cover - an embedder always has parameters
+        return torch.device("cpu")
 
 
 def _embedder_core(

@@ -25,6 +25,13 @@ data/
 *.bin
 runs/**/*.log
 
+# Built artifacts are the same kind of thing, one level down: reproducible from the command,
+# and mostly too large for git. The manifests are kept, because they are the record of what
+# the gates measured and what the artifact promised -- the part a reviewer reads.
+artifacts/**
+!artifacts/**/
+!artifacts/**/manifest.json
+
 # Notebook / editor noise
 .ipynb_checkpoints/
 .DS_Store

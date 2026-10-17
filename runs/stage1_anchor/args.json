@@ -1,0 +1,32 @@
+{
+  "model": "jhu-clsp/ettin-encoder-17m",
+  "data": [
+    "data/pg84.txt",
+    "data/pg1342.txt",
+    "data/pg2701.txt"
+  ],
+  "steps": 6000,
+  "batch_size": 4,
+  "max_bytes": 512,
+  "lr": 0.0003,
+  "weight_decay": 0.1,
+  "warmup": 100,
+  "stitch_depth": -1,
+  "lambda_b": 4.0,
+  "lambda_emb": 1.0,
+  "lambda_e": 1.0,
+  "eval_every": 2000,
+  "eval_batches": 4,
+  "eval_texts": 256,
+  "n_train": 4000,
+  "local_layers": 1,
+  "local_backend": "attention",
+  "local_window": 128,
+  "local_ffn": 1024,
+  "boundary_predictor": "mlp",
+  "grad_clip": 1.0,
+  "seed": 0,
+  "device": "mps",
+  "out": "runs/stage1_anchor",
+  "log_every": 50
+}

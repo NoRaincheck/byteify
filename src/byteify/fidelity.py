@@ -48,7 +48,13 @@ def _budgeted_patch_reps(embedder, batch):
     encoder = embedder.encoder
     h = encoder.local_encoder(encoder.embed(batch.byte_ids, batch.expanded_ids), batch.byte_mask)
     probs = torch.sigmoid(encoder.boundary_predictor(h))
-    patches = select_budgeted_patches(probs, batch.byte_mask, embedder.n_patches,
+    # Clamp to this batch's byte axis, exactly as the serving path does in `_embedder_core`.
+    # A batch of short texts pads to fewer bytes than the patch axis, and asking for more
+    # patches than there are byte positions raised rather than filled what it could: the
+    # contrastive stage died on any corpus of short texts, including this repository's own
+    # synthetic one.
+    patches = select_budgeted_patches(probs, batch.byte_mask,
+                                      min(embedder.n_patches, batch.byte_mask.shape[1]),
                                       embedder.threshold)
     idx = patches.end_indices.unsqueeze(-1).expand(-1, -1, h.shape[-1])
     reps = h.gather(1, idx) * patches.mask.unsqueeze(-1).to(h.dtype)
@@ -93,9 +99,17 @@ def measure_fidelity(
     ``nn_agree``     nearest-neighbour agreement
     ``boundary_acc`` boundary-decision agreement
     ``cos@depth``    per-position cosine at the stitching depth
+
+    **Centring is over the whole evaluation set, not over each batch.** Removing the
+    dominant direction means subtracting the mean of the population, and a batch of four
+    does not estimate a mean: the same checkpoint measured 0.885 through this function with
+    batches of sixteen and 0.672 with batches of four, on the same held-out texts. A
+    fidelity number that moves when the batching moves is measuring the batch, so the
+    centring happens once, after every batch has been pooled. ``cos_emb_raw`` is unaffected
+    by this and is reported precisely so the two can be compared.
     """
-    s_embs: list[Tensor] = []
-    t_embs: list[Tensor] = []
+    s_pooled: list[Tensor] = []
+    t_pooled: list[Tensor] = []
     cos_by_depth: dict[int, list[float]] = {}
     b_correct = 0.0
     b_total = 0
@@ -108,8 +122,8 @@ def measure_fidelity(
 
         s = pool_final(student, patch_mask, source.final_norm)
         t = pool_final(teacher, batch.attention_mask.bool(), source.final_norm)
-        s_embs.append(F.normalize(s - s.mean(0), dim=-1).cpu())
-        t_embs.append(F.normalize(t - t.mean(0), dim=-1).cpu())
+        s_pooled.append(s.cpu())
+        t_pooled.append(t.cpu())
 
         cos_by_depth.setdefault(depth, []).extend(
             F.cosine_similarity(student, teacher, dim=-1)[patch_mask].flatten().cpu().tolist()
@@ -125,8 +139,12 @@ def measure_fidelity(
         b_correct += ((probs > 0.5)[valid] == batch.boundaries[valid].bool()).sum().item()
         b_total += batch.boundaries[valid].numel()
 
-    s_all = torch.cat(s_embs)
-    t_all = torch.cat(t_embs)
+    s_raw = torch.cat(s_pooled)
+    t_raw = torch.cat(t_pooled)
+    # One centring for the whole evaluation set, so the metric does not depend on how the
+    # texts were batched on the way in.
+    s_all = F.normalize(s_raw - s_raw.mean(0, keepdim=True), dim=-1)
+    t_all = F.normalize(t_raw - t_raw.mean(0, keepdim=True), dim=-1)
     n = s_all.shape[0]
     if n < 3:
         raise ValueError(
@@ -135,10 +153,25 @@ def measure_fidelity(
     upper = torch.triu_indices(n, n, offset=1)
     s_sim = s_all @ s_all.T
     t_sim = t_all @ t_all.T
+    # The raw number, computed from the uncentred embeddings. Computing it from the
+    # centred ones -- which is what this did -- makes it identical to ``cos_emb_c`` by
+    # construction, and a metric that cannot show the anisotropy it exists to expose
+    # cannot warn anyone about it.
+    s_unit = F.normalize(s_raw, dim=-1)
+    t_unit = F.normalize(t_raw, dim=-1)
 
     return {
         "cos_emb_c": (s_all * t_all).sum(-1).mean().item(),
-        "cos_emb_raw": F.cosine_similarity(s_all, t_all, dim=-1).mean().item(),
+        "cos_emb_raw": F.cosine_similarity(s_unit, t_unit, dim=-1).mean().item(),
+        # How aligned the two models' dominant directions are. Reported next to the raw
+        # cosine because "raw 0.99" is mostly this number, and an artifact whose dominant
+        # direction matches its source's while its centred geometry does not is exactly the
+        # failure mode centring exists to catch.
+        "dominant_dir_cosine": (
+            F.cosine_similarity(s_unit.mean(0, keepdim=True), t_unit.mean(0, keepdim=True))
+            .squeeze()
+            .item()
+        ),
         "sim_corr": pearson(s_sim[upper[0], upper[1]], t_sim[upper[0], upper[1]]).item(),
         "nn_agree": (
             s_sim.fill_diagonal_(float("-inf")).argmax(-1)

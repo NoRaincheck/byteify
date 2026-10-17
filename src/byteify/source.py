@@ -53,12 +53,17 @@ class SourceEncoder(nn.Module):
 class HuggingFaceSourceEncoder(SourceEncoder):
     """Works for ModernBERT and BERT-family encoders alike."""
 
-    def __init__(self, model: nn.Module, model_id: str = "") -> None:
+    def __init__(self, model: nn.Module, model_id: str = "", layout: str = "memory") -> None:
         super().__init__()
         self.model = model
         # Recorded so a manifest built from this encoder can name what it byteified.
         # Empty when the caller loaded the weights some other way.
         self.model_id = model_id
+        #: How the weights were found: ``checkpoint``, ``module`` or ``memory``. See
+        #: :mod:`byteify.hub`; a model reached through a custom-code module layout is a
+        #: different provenance from one ``AutoModel`` read at the repository root, and a
+        #: build says which it used.
+        self.layout = layout
         cfg = model.config
         self.d_model = int(cfg.hidden_size)
         self.vocab_size = int(cfg.vocab_size)
@@ -241,25 +246,23 @@ def resolve_source_encoder(model_or_name) -> HuggingFaceSourceEncoder:
     """Load a model by id (or wrap an already-loaded one) as a SourceEncoder.
 
     Accepts a clear error rather than a traceback for a model this repository cannot
-    byteify, naming what is accepted.
+    byteify, naming what is accepted. Both repository layouts resolve -- a plain
+    checkpoint, and a custom-code module that keeps its encoder in a subdirectory -- see
+    :mod:`byteify.hub`, which is where the second one is implemented.
     """
-    if isinstance(model_or_name, str):
-        from transformers import AutoModel
+    from .hub import resolve_source_model
 
+    if isinstance(model_or_name, str):
         model_id = model_or_name
-        try:
-            model = AutoModel.from_pretrained(model_id)
-        except OSError as exc:
-            raise FileNotFoundError(
-                f"could not load {model_id}: {exc}\n"
-                "If it is not in the local HuggingFace cache, download it first "
-                "(unset HF_HUB_OFFLINE). A local directory path also works."
-            ) from exc
+        resolved = resolve_source_model(model_or_name)
+        model = resolved.model
+        layout = resolved.layout
     else:
         model = model_or_name
         model_id = getattr(model_or_name, "name_or_path", "") or ""
+        layout = "memory"
     try:
-        return HuggingFaceSourceEncoder(model, model_id=model_id)
+        return HuggingFaceSourceEncoder(model, model_id=model_id, layout=layout)
     except TypeError as exc:
         raise TypeError(
             f"{model_id or type(model).__name__} is not a byteify source model. Accepted "

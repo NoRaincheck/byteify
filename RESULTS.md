@@ -193,25 +193,32 @@ of text than English does.
 Byteifying a different embedding model is a **config change**. Three things had to be made
 tokenizer- and architecture-agnostic, and each turned up a real defect.
 
-`scripts/verify_reuse.py`, six models, **100% vocabulary coverage and zero alignment errors
-in all six**:
+`scripts/verify_reuse.py`, seven models, **100% vocabulary coverage and zero alignment errors
+in all seven**:
 
 | model | arch | tokenizer | params | local % | B/patch | gaps absorbed | ok |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | ettin-encoder-17m | modernbert | bytelevel | 16.8M | 2.7 | 3.30 | 0 | yes |
 | ettin-encoder-32m | modernbert | bytelevel | 31.9M | 2.8 | 3.30 | 0 | yes |
 | ModernBERT-base | modernbert | bytelevel | 149.0M | 2.0 | 3.30 | 0 | yes |
-| all-MiniLM-L6-v2 | bert | wordpiece | 22.7M | 3.9 | 3.75 | 0 | yes |
-| bert-base-uncased | — | wordpiece | — | — | 3.34 | 32 | yes |
-| xlm-roberta-base | — | sentencepiece | — | — | 2.90 | 32 | yes |
+| all-MiniLM-L6-v2 | bert | wordpiece | 22.7M | 3.9 | 3.61 | 0 | yes |
+| bert-base-uncased | — | wordpiece | — | — | 3.51 | 68 | yes |
+| xlm-roberta-base | — | sentencepiece | — | — | 3.04 | 46 | yes |
+| bekko-system-one-v0-17m | modernbert | bytelevel | 16.8M | 2.7 | 3.30 | 0 | yes |
+
+The last row resolves through a custom-code module layout rather than a plain checkpoint
+(§10.5, ADR 0012), and it is not an embedding model: it is a typed-decision model, byteified
+on its own workload.
 
 **What this table does and does not say.** It says alignment is lossless across all three
-tokenizer families. It does **not** say six gated, level-1 artifacts exist. `byteify` has
-published fidelity floors for exactly one source model — `jhu-clsp/ettin-encoder-17m`, at
-cos_emb_c 0.75, sim_corr 0.60, boundary_acc 0.90 — and refuses the other five with a
-message saying so, because fidelity numbers do not transfer between architectures and
-borrowing them would be the same error as hardcoding them. Turning a verified model into a
-gateable one means training it and publishing its measured floors; see issue #15.
+tokenizer families. It does **not** say seven gated, level-1 artifacts exist. `byteify` has
+published fidelity floors for two source models — `jhu-clsp/ettin-encoder-17m`, at
+cos_emb_c 0.75, sim_corr 0.60, boundary_acc 0.90, and `hotchpotch/bekko-system-one-v0-17m`
+at 0.80 / 0.97 / 0.99 — and refuses the other five with a message saying so, because
+fidelity numbers do not transfer between architectures and borrowing them would be the same
+error as hardcoding them. Turning a verified model into a gateable one means training it and
+publishing its measured floors; see issue #15, and §10.5 for what that cost on the second
+model.
 
 Three defects surfaced while doing this, each of which would have silently corrupted training:
 
@@ -394,12 +401,18 @@ training and retrieval/character-level evaluation against the baselines in §9.
 2. **Stage 2 is implemented but untrained.** Expect fidelity to the source model to *drop*
    while byte-level competence rises; that trade is the point of the stage and needs
    evaluation that can see the gain, not just the loss.
-3. **No evaluation that measures the actual claim.** `contrastive.retrieval_metrics` computes
-   recall/MRR/nDCG, but there is no retrieval dataset wired up and nothing has been run at a
-   budget where the number means anything. Non-English / code / bio are where byte level
-   should win (see the compression table).
-4. **Contrastive training is a smoke test only** — 60 steps on 300 mined pairs. The loss
-   behaves correctly in tests but has never been trained to a useful retrieval accuracy.
+3. **Level 2 has no retrieval objective that fits a decision workload.** A retrieval
+   judgement set now exists (2,000 held-out Open-Jev decisions, §10.5) and the gate is
+   wired, but contrastive training on mined near-duplicate pairs does not improve candidate
+   ranking on it — seven rungs measured, and the only one that both held level 1's floors and
+   beat 0.45 recall@1 did no contrastive training at all. Non-English / code / bio are still
+   where byte level should win (see the compression table). What is needed is positives mined
+   from query-to-candidate pairs with the judgement set split so the gate grades on unseen
+   decisions.
+4. **Contrastive training is a smoke test only** — it has never been trained to a useful
+   retrieval accuracy, and on the one real judgement set available it does not get there.
+   The four defects that had to be fixed to run it at all are in §10.5; the objective is the
+   remaining problem, not the plumbing.
 5. **Character-level (CUTE-style) data** from the paper is not implemented; the paper adds
    75M tokens of it specifically to accelerate character understanding.
 6. **Task arithmetic is verified mechanically but not semantically** — no post-trained ettin
@@ -450,6 +463,273 @@ Swap no longer grows during a run. A higher-throughput configuration is still av
 *(An attempt to cap the MPS allocator via `PYTORCH_MPS_HIGH_WATERMARK_RATIO` was reverted:
 the ratio is version-dependent and this build rejects it outright.)*
 
+## 10.5 A second source model, and what it cost to make it gateable
+
+`jhu-clsp/ettin-encoder-17m` is a plain HuggingFace checkpoint, so pointing `byteify` at
+another embedding model really was a configuration change — until
+[`hotchpotch/bekko-system-one-v0-17m`](https://huggingface.co/hotchpotch/bekko-system-one-v0-17m),
+which is not. It is a typed-decision model: instructions, application state and candidate
+definitions in, a probability distribution over those candidates out. It is also a
+custom-code sentence-transformers repository, so `AutoModel` cannot read it at all:
+
+```
+modules.json                              -> the module directory, 0_BekkoInference
+0_BekkoInference/backbone_config.json     -> the config is not called config.json
+0_BekkoInference/model.safetensors        -> keys prefixed `encoder.backbone.`
+0_BekkoInference/heads.{choice,noul,score}-> three task heads, beside the encoder
+0_BekkoInference/tokenizer/               -> the tokenizer is not at the root
+```
+
+This mattered more than it looks. A byteified encoder delegates its patch representations to
+the frozen source encoder — level 1's fidelity guarantee *is* that delegation — so the source
+model is re-fetched on every `byteify encode` call. A repository byteify can build from but
+cannot serve is not a supported target; it would have produced an artifact that trained,
+gated, exported, and then failed on first use. [ADR 0012](docs/adr/0012-source-models-that-are-not-plain-checkpoints)
+resolves both layouts to the same model and tokenizer and names which one it found. Plain
+checkpoints still go through `AutoModel`, so the ordinary path is unchanged.
+
+Two details in that work are worth recording because both were silent:
+
+* `AutoTokenizer.from_pretrained` does not raise `OSError` for a repository whose layout it
+  does not recognise. A directory that exists and holds no `config.json` is a `ValueError`
+  naming the missing key. Catching only `OSError` meant the fallback never ran, and the
+  failure surfaced as "unrecognised model" from deep inside `transformers`.
+* The task heads are stored beside the encoder under a prefix no encoder parameter claims.
+  A remap that discarded them quietly would be indistinguishable from one that found the
+  wrong prefix, so they are stripped from a **declared** prefix list and reported by name at
+  build time: six tensors, `heads.{choice,noul,score}.{weight,bias}`.
+
+### The model is byte-identical to the anchor's tokenizer
+
+| | anchor | bekko |
+| --- | --- | --- |
+| architecture | ModernBERT, 7 × 256, 4 heads | identical |
+| vocabulary | 50,368 byte-level BPE entries | identical, entry for entry |
+| special-token pseudo-bytes | 7 | identical |
+| suffix-trie coverage | 1.00 | 1.00 |
+
+So none of the tokenizer-family caveats in §5.6 apply here: byte-level BPE with no
+normaliser, coverage complete, `tokenizer_free: true`. What differs is the workload, not the
+bytes.
+
+### Reference data has to be the model's own workload
+
+Training the byte interface on Project Gutenberg and gating it on decisions would measure a
+model for a workload it never sees. `scripts/prepare_decision_corpus.py` renders
+[`ZefanCai/Open-Jev`](https://huggingface.co/datasets/ZefanCai/Open-Jev) the way
+`bekko-system-one` renders it at inference time — `Instruction: …\nState: …` in the
+`instruction_state` prefix layout, `Candidate: {id}: {description}` per candidate, with a
+Noul decision's two authored meanings folded into the state JSON exactly as `input_groups`
+composes them. 20,000 texts from the train split; 2,000 held-out decisions from validation
+(the split policy is by `group_id`, so no decision shares a state with another split).
+
+### Measured floors
+
+`scripts/measure_thresholds.py` measures on the gate's own path — budgeted patching, 512-byte
+axis, patch budget 128, batch 4, the gate's 64 held-out texts — and reports the random-init
+contrast, because a floor is only meaningful next to the number an untrained interface gets:
+
+| metric | random init | after Stage 1 (6,000 steps) | published floor |
+| --- | --- | --- | --- |
+| centred cosine `cos_emb_c` | 0.078 | **0.889** | 0.80 |
+| similarity-matrix correlation `sim_corr` | 0.949 | **0.985** | 0.97 |
+| boundary accuracy | 0.671 | **0.996** | 0.99 |
+| suffix-trie coverage | — | 1.000 | 0.99 |
+| raw cosine | 0.164 | 0.989 | — |
+
+`byteify build --level faithful` then cleared all five checks (cos_emb_c 0.913, sim_corr
+0.980, boundary 0.996, trie coverage 1.00) and the exported graph matched eager PyTorch to
+1.4e-06. The artifact then serves through its manifest alone on both the Python and the ONNX
+path, with no tokenizer present.
+
+**`sim_corr` barely discriminates on this corpus, and saying so matters.** An untrained byte
+interface already reaches 0.949 against a trained 0.985. Rendered decisions from one
+generator are homogeneous — same instruction templates, same state shapes — so almost any
+embedding reproduces their coarse cluster structure, and the centred cosine is doing almost
+all of the separating. The floor is set at 0.97 because it can be set at all; the numbers
+that make this gate able to fail are `cos_emb_c` (0.078 → 0.889) and `boundary_acc` (0.671 →
+0.996). This is the anisotropy warning of §4.3 arriving from the opposite direction: a
+metric that reads 0.95 on an untrained model is not measuring what its name suggests.
+
+### Two defects the measurement found, both of which were in the gate
+
+**The gate graded sixteen texts.** The same Stage 1 checkpoint measured centred cosine 0.662
+through the gate on one sixteen-text slice and 0.885 on another, from the same corpus. A
+gate that size reports the slice it drew rather than the artifact. `GATE_TEXTS` is now 64,
+which holds to about 0.01 and costs two seconds. Widening it can only help the anchor: its
+published floors were measured on the smaller slice.
+
+**Centring was applied per batch.** Removing the dominant direction means subtracting the mean
+of the population, and a batch of four does not estimate a mean. The same checkpoint scored
+0.885 through this repository's measurement path at batch 16 and 0.672 at batch 4 — on
+identical texts. `measure_fidelity` now pools every batch and centres once. The anchor's
+floors were re-measured under the corrected metric and are unchanged (0.824 / 0.629 / 0.949
+against floors 0.75 / 0.60 / 0.90).
+
+A third defect fell out of the same change: `cos_emb_raw` was computed from the already
+centred vectors, so it was *identical to* `cos_emb_c` by construction — the raw number ADR
+0005 exists to keep visible was not being kept visible. It now reads 0.989 against a centred
+0.889, which is the anisotropy, visible.
+
+### Level 2 could not be built, and the reason is not a bug
+
+Level 2 declares that it guarantees everything `faithful` guarantees **plus** retrieval
+quality on the supplied judgements. Measured on 2,000 held-out Open-Jev decisions:
+
+| | recall@1 | MRR |
+| --- | --- | --- |
+| chance (mean 1/k over each decision's own pool) | 0.419 | — |
+| **the source model itself** | **0.262** | 0.587 |
+| byteified, three Stage 1 runs of one recipe | 0.488 / 0.301 / 0.281 | 0.697 / 0.612 / — |
+| after the level-2 contrastive stage | 0.551 | 0.732 |
+
+Two facts fall out, and the second is the one that decided it.
+
+**The source model is below chance at this.** Ranking candidates by cosine between mean-pooled
+embeddings is not how `bekko-system-one` decides; it decides through its three heads over a
+shared-prefix encoder. So "retrieval quality on this workload", measured this way, is not a
+capability of the model, and a byteified artifact beating its own source on it (0.488 vs
+0.262) says the metric is measuring something else — not that the artifact is better.
+
+**The spread between identical runs is wider than any margin.** Three Stage 1 runs of one
+recipe scored 0.488, 0.301 and 0.281. A floor placed anywhere in that range fails half of
+identical runs, which is a coin flip dressed as a gate. `scripts/contrastive_tradeoff.py`
+walked seven rungs of the contrastive stage to see whether a gentler recipe could clear both
+sides, and none could:
+
+| contrastive steps | lr | `cos_emb_c` | `sim_corr` | boundary | recall@1 | level 1 holds |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | — | 0.889 | 0.985 | 0.996 | 0.488 | yes |
+| 150 | 2e-5 | 0.847 | 0.985 | 0.996 | 0.295 | yes |
+| 500 | 2e-5 | 0.806 | 0.980 | 0.995 | 0.295 | yes |
+| 1500 | 2e-5 | 0.772 | 0.987 | 0.991 | 0.299 | no |
+| 150 | 1e-4 | 0.595 | 0.949 | 0.967 | 0.291 | no |
+| 500 | 1e-4 | 0.543 | 0.930 | 0.914 | 0.273 | no |
+| 1500 | 1e-4 | 0.573 | 0.947 | 0.867 | 0.524 | no |
+
+The only rung that both holds level 1 and beats 0.45 is the one that does no contrastive
+training at all. A second experiment — freezing `embed.byte` and `embed.suffix`, the tables
+initialised from the source model's own embedding matrix, and training only the local
+encoder and the boundary head — preserved fidelity (cos_emb_c 0.869 after 1,500 steps) and
+left recall@1 at 0.287. So the trade-off is not a matter of training too hard or touching
+the wrong parameters: contrastive training on mined near-duplicate pairs does not improve
+candidate ranking for this workload at all.
+
+The consequence is a refusal, which is the product behaving correctly. `byteify build
+--level adapted --judgements …` for this model stops in seconds:
+
+```
+error: hotchpotch/bekko-system-one-v0-17m has no published retrieval floor, and judgements
+were supplied.
+Measure retrieval for this source model and add `retrieval_recall_at_1` to
+byteify/assets/thresholds.json.
+```
+
+**So this model publishes fidelity floors and no retrieval floor**, and
+`require_retrieval_floor` makes a level-2 build with judgements impossible until someone
+measures a floor that the run-to-run spread can support. What would actually be needed is a
+different objective for level 2 on a decision workload — mining positives from
+query-to-gold-candidate pairs rather than from text near-duplicates — with the judgement set
+split so the gate grades on decisions the contrastive stage never saw. That is a design
+change with a leakage hazard attached, and it is not something to smuggle in as a recipe
+tweak.
+
+### Four bugs the level-2 path had, none of which any test reached
+
+`--level adapted` had never run end to end. Reaching it took:
+
+1. `train_contrastive_on_corpus` indexed the `ByteBatch` that `encode_texts` returns as
+   though it were a sequence of rows — `TypeError` on the first step.
+2. `infonce` returns a `ContrastiveLoss` record, and the caller called `.backward()` on it.
+   The research script that shares the loss already used `.total`.
+3. `ContrastiveHead.forward` returns `(projection, temperature)`. The caller passed the tuple
+   to `infonce`, so the learned temperature — the module's one distinct idea — never trained.
+4. `_budgeted_patch_reps` asked for `embedder.n_patches` patches regardless of how many byte
+   positions the batch had, and died on any corpus of short texts including this repository's
+   own synthetic fixture. The serving path already clamped this; the training path did not.
+
+Each was one line from the interface as documented, and each was invisible because the
+unit-testable parts of the module were tested and the one level that calls them was not. The
+regression test is four steps on the synthetic fixture (`test_contrastive_training_on_a_corpus_runs_and_lowers_its_own_loss`).
+
+### Grading the artifact in the decision path, not beside it
+
+The retrieval numbers above are a proxy, and §10.5's own caveat says so: the source model is
+below chance at them because ranking candidates by cosine between mean-pooled embeddings is
+not how it decides. Reading `inference_v0.py` gives the real path —
+
+```
+prefix_ids  = tokenised query (instruction + state), CLS/SEP bracketed
+doc_ids     = tokenised candidates ("Candidate: {id}: {description}")
+hidden      = encoder(backbone)(prefix_ids, prefix_mask, doc_ids, doc_mask, owners)
+              -- the prefix is encoded alone; every candidate's tokens attend to
+                 [its query's keys, its own keys]
+pooled      = masked mean over the candidate's token positions
+scores      = heads[task](pooled)            -- one scalar per candidate
+probs       = softmax(scores) within the decision
+```
+
+— a cross-attention encoder with three task heads, not an embedding. `scripts/decision_harness.py`
+runs that path for the source model and for the artifact, substituting only the
+representation: the artifact's pooled vector for the query and for each candidate enters as a
+one-token sequence, and the backbone, the cross-attention and the heads are the source model's
+own weights. The harness refuses to report byteified numbers unless its own source path
+reproduces the model's `predict_groups`; it does, to 1.5e-06.
+
+On 150 held-out validation decisions, 512-byte axis:
+
+| kind | n | chance | source | source @ axis | byteified | agreement | mean TV |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| choice | 37 | 0.323 | 0.622 | 0.595 | 0.270 | 0.216 | 0.259 |
+| noul | 95 | 0.500 | 0.568 | 0.505 | 0.400 | 0.747 | 0.228 |
+| score | 18 | 0.259 | 0.778 | 0.722 | 0.056 | 0.111 | 0.491 |
+| **all** | 150 | 0.428 | **0.607** | 0.553 | **0.327** | 0.540 | 0.267 |
+
+**Byteification, measured on the thing the model is for, costs about half the decision
+accuracy**: 0.607 → 0.327, and the two paths pick the same candidate 54% of the time.
+`source @ axis` is the control that makes this readable — the same model on the bytes the
+artifact's axis can hold — and it costs 0.054, so the loss is byteification and not
+truncation.
+
+That is a harder result than the embedding-space gates report (centred cosine 0.913), and it
+is not a contradiction. Averaging the representation over a whole document preserves a great
+deal of what a pooled embedding is judged on while discarding exactly the per-token
+contextualisation a cross-attention decision depends on: noul, whose two candidates differ by
+one word, survives at 0.747 agreement; score, whose candidates are full rubric sentences,
+collapses to 0.111. A byteified artifact should be expected to serve retrieval and
+clustering tasks, and this model should be expected to lose its decision heads' accuracy
+through it.
+
+The honest scope of that number: it is 150 decisions, and the byteified path scores one pooled
+vector where the source scores tokens attending to the query. It is the weakest task the
+artifact can be asked to do, which is why it is the right one to ask.
+
+### What was established
+
+Byteifying a custom-code, non-embedding, decision model end to end: a gated level-1 artifact
+that serves on both the Python and the ONNX path through its manifest alone, with no
+tokenizer in the path, from a repository that `AutoModel` cannot open. What was not
+established is anything about level 2 on this workload, and the numbers above say why rather
+than leaving it to be discovered later.
+
+### Two limits the artifact carries, measured
+
+**The byte axis is the artifact's, not the workload's.** Open-Jev decision queries have a
+median of 530 bytes and a 90th percentile of 1,750; at `--max-bytes 512` only 44% of them fit,
+at 2,048 almost all do. A second artifact was built at a 2,048-byte axis with a 512-patch
+budget, and **it failed its own gates** (sim_corr 0.812 against a floor of 0.97, boundary_acc
+0.980 against 0.99), so it wrote nothing and no such artifact exists. The longer the byte
+stream, the more of it one patch budget has to cover and the harder the fidelity constraint
+is to hold — which is the same tension ADR 0009 records for levels, showing up here as an
+axis length. The 512-byte artifact is the one that passes; its truncation cost is measured
+above at 0.054 decision accuracy, not assumed to be zero.
+
+**The decision heads are not in the artifact, and could not be.** Byteification distils the
+encoder and its pooled representation. What the three task heads read from that
+representation is what an artifact can serve; the heads themselves are the source model's
+files, and shipping them would mean shipping a decision model rather than an embedding. The
+harness attaches them to measure fidelity, and it measures a real loss.
+
 ## 11. Layout
 
 ```
@@ -457,6 +737,8 @@ src/byteify/alignment.py       byte<->subword alignment, B_subword, gap absorpti
 src/byteify/vocab.py           vocabulary -> byte strings, per tokenizer family
 src/byteify/expand.py          T_SubwordSuffix via a reverse-order byte trie
 src/byteify/source.py          generic source-encoder adapter + ByteifyConfig
+src/byteify/hub.py             resolving a source model that is not a plain checkpoint
+                               (plain `config.json`, or a sentence-transformers module dir)
 src/byteify/model.py           byte embeddings, local encoder, boundary predictor, pooling,
                                depooling, byte MLM head, partial-depth forward
 src/byteify/losses.py          L_B, L_E, L_emb, masked-byte CE, MLM masking
@@ -465,6 +747,7 @@ src/byteify/task_arithmetic.py post-training transfer from a subword checkpoint
 src/byteify/data.py            corpus loading, length-grouped batching
 src/byteify/inference.py       budgeted patching, ByteifiedEmbedder, ONNX export
 src/byteify/contrastive.py     InfoNCE, learned temperature, pair mining, retrieval metrics
+                               over judgement pools
 src/byteify/stitching.py       batching, teacher states, metrics
 src/byteify/bytestream.py      the declared byte-stream rule, one per tokenizer family
 src/byteify/fidelity.py        one fidelity measurement, two explicit patch-selection rules
@@ -482,10 +765,18 @@ scripts/train_stage1.py        Stage 1 as a run with a checkpoint at a chosen pa
 scripts/train_stage2.py        Stage 2: end-to-end byte-level MLM (research path)
 scripts/compression_sweep.py   the efficiency experiment
 scripts/fidelity_probe.py      single-batch Stage 1 diagnostic
-scripts/verify_reuse.py        reuse check across six models
+scripts/verify_reuse.py        reuse check across seven models
 scripts/measure_compression.py compression ratio by domain
 scripts/train_contrastive.py  contrastive fine-tuning (the retrieval objective)
 scripts/export_onnx.py         ONNX export + numerical verification, outside the command
+scripts/prepare_decision_corpus.py  render a typed-decision dataset into reference texts
+                                    and judgements, in the model's own prompt layout
+scripts/measure_thresholds.py  measure one source model's floors on the gate's own metric,
+                               against an untrained byte interface
+scripts/contrastive_tradeoff.py  where level 2 stops being level 1: fidelity and retrieval
+                                after each rung of the contrastive stage
+scripts/decision_harness.py      grade an artifact inside the model's own decision path,
+                                against the model's own predict_groups as the reference
 ```
 
 ## 12. Reproducing
@@ -504,11 +795,35 @@ HF_HUB_OFFLINE=1 uv run byteify build \
     --steps 6000 --batch-size 4 --max-bytes 512 --patch-budget 128
 HF_HUB_OFFLINE=1 uv run byteify encode ./artifact --text "the quick brown fox"
 
+# the second source model (section 10.5): a custom-code module repository, byteified on
+# its own workload. The corpus and the judgements are rendered from a public dataset.
+uv run --with pyarrow python scripts/prepare_decision_corpus.py --train-texts 20000
+HF_HUB_OFFLINE=1 uv run byteify build \
+    --model hotchpotch/bekko-system-one-v0-17m --level faithful \
+    --data data/corpus/open-jev-train.jsonl --out ./bekko-artifact \
+    --steps 6000 --batch-size 4 --max-bytes 512 --patch-budget 128
+
 # the measurements in this document
 HF_HUB_OFFLINE=1 uv run byteify levels
 HF_HUB_OFFLINE=1 uv run python scripts/verify_reuse.py        # section 5
 HF_HUB_OFFLINE=1 uv run python scripts/measure_compression.py # bytes/patch by domain
 HF_HUB_OFFLINE=1 uv run python scripts/compression_sweep.py --init <checkpoint.pt>
+
+# the floors behind src/byteify/assets/thresholds.json (section 10.5)
+HF_HUB_OFFLINE=1 uv run python scripts/measure_thresholds.py \
+    --model hotchpotch/bekko-system-one-v0-17m \
+    --data data/corpus/open-jev-train.jsonl --checkpoint runs/stage1_bekko/stage1.pt \
+    --judgements data/judgements/open-jev-validation.jsonl --out runs/thresholds_bekko.json
+HF_HUB_OFFLINE=1 uv run python scripts/contrastive_tradeoff.py \
+    --model hotchpotch/bekko-system-one-v0-17m --checkpoint runs/stage1_bekko/stage1.pt \
+    --data data/corpus/open-jev-train.jsonl \
+    --judgements data/judgements/open-jev-validation.jsonl
+
+# the decision path itself (section 10.5), with the model's own predict_groups as reference
+uv run --with sentence-transformers --with pyarrow python scripts/decision_harness.py \
+    --artifact artifacts/bekko-17m-faithful \
+    --judgements data/judgements/open-jev-validation.jsonl --limit 150 \
+    --out runs/decision_harness_bekko.json
 ```
 
 `HF_HUB_OFFLINE=1` is set throughout: everything runs from the local cache and the local

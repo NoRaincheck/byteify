@@ -98,6 +98,11 @@ class ByteStreamRule:
             "open_pseudo": self.open_pseudo,
             "close_pseudo": self.close_pseudo,
             "pseudo_bytes": {str(k): v for k, v in sorted(self.pseudo_bytes.items())},
+            # Carried in the manifest rather than recomputed by whoever reads it: whether
+            # this artifact can take text with no tokenizer present is the difference
+            # between a byte-native serving artifact and one that is not, and the reader
+            # should not have to know the rule vocabulary to find out.
+            "tokenizer_free": self.tokenizer_free,
         }
 
     @classmethod

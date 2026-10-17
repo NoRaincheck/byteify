@@ -60,6 +60,11 @@ class Thresholds:
     onnx_max_abs_diff: float = 1e-4
     #: Suffix-trie coverage floor, measured over the reference data.
     trie_coverage: float = 0.0
+    #: Recall@1 on the supplied judgements, level 2 only. Zero means "no floor
+    #: published", which is why a build that is given judgements for a source model with
+    #: no floor here is refused rather than measured against zero: a gate that cannot
+    #: fail is not a gate.
+    retrieval_recall_at_1: float = 0.0
     note: str = ""
 
     @classmethod
@@ -79,6 +84,11 @@ def _published() -> dict[str, Thresholds]:
 
 def published_source_ids() -> list[str]:
     return sorted(_published())
+
+
+def assets_path(name: str) -> str:
+    """The on-disk path of a packaged asset, for a message that tells a reader where to edit."""
+    return str(resources.files("byteify").joinpath("assets", name))
 
 
 def thresholds_for(source_id: str) -> Thresholds:
@@ -259,3 +269,36 @@ def check_coverage(report: GateReport, coverage: float | None, thresholds: Thres
     if coverage is None:
         return
     report.add("trie_coverage", coverage, thresholds.trie_coverage)
+
+
+def require_retrieval_floor(source_id: str, thresholds: Thresholds) -> None:
+    """Refuse to grade retrieval against a floor nobody published.
+
+    Judgements are supplied precisely so the level-2 guarantee is checkable. Running the
+    check against a floor of zero would return a pass for every artifact and record it as
+    a guarantee, which is the failure this repository exists to prevent: a number that
+    cannot fail, presented as one that did.
+    """
+    if thresholds.retrieval_recall_at_1 <= 0.0:
+        raise ValueError(
+            f"{source_id} has no published retrieval floor, and judgements were supplied.\n"
+            f"Measure retrieval for this source model and add `retrieval_recall_at_1` to "
+            f"byteify/assets/{THRESHOLD_RESOURCE}."
+        )
+
+
+def check_retrieval(
+    report: GateReport,
+    *,
+    embed,
+    judgements,
+    thresholds: Thresholds,
+    batch_size: int = 8,
+) -> dict[str, float]:
+    """Recall on the supplied judgements, against that source model's published floor."""
+    from .contrastive import retrieval_over_judgements
+
+    metrics = retrieval_over_judgements(embed, judgements, batch_size=batch_size)
+    report.add("retrieval_recall_at_1", metrics["recall@1"], thresholds.retrieval_recall_at_1)
+    report.extra["retrieval"] = metrics
+    return metrics

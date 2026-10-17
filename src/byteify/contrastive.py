@@ -244,6 +244,11 @@ def train_contrastive_on_corpus(
     head = ContrastiveHead(encoder.embed.byte.weight.shape[1]).to(device)
     params = list(encoder.parameters()) + list(head.parameters())
     opt = torch.optim.AdamW(params, lr=lr)
+    # The head learns the temperature, so it is the head's own value rather than the
+    # argument, and it comes back with every projection. Unpacking it here is what makes
+    # the learned temperature actually train.
+    def project(rows) -> Tensor:
+        return head(embed(rows))[0]
 
     def embed(batch_rows) -> torch.Tensor:
         reps, mask, _ = _budgeted_patch_reps(embedder, batch_rows)
@@ -253,27 +258,93 @@ def train_contrastive_on_corpus(
     for done, batch in enumerate(pair_batches(pairs, batch_size, seed=seed), start=1):
         if done > steps:
             break
-        rows = encode_texts(
-            [truncate_to_bytes(t, max_bytes) for pair in batch for t in pair],
+        # Two batches, not one sliced: `encode_texts` returns a ByteBatch, which is not a
+        # sequence of rows. Indexing it raised TypeError, which meant level 2 -- the level
+        # this module exists for -- had never run end to end.
+        anchors = encode_texts(
+            [truncate_to_bytes(pair[0], max_bytes) for pair in batch],
             tokenizer,
             add_special_tokens=True,
             device=device,
         )
-        half = len(batch)
+        positives = encode_texts(
+            [truncate_to_bytes(pair[1], max_bytes) for pair in batch],
+            tokenizer,
+            add_special_tokens=True,
+            device=device,
+        )
         loss = infonce(
-            head(embed(rows[:half])), head(embed(rows[half:])),
-            temperature=temperature,
+            project(anchors), project(positives),
+            temperature=head.temperature(),
         )
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        # `infonce` returns a ContrastiveLoss, not a tensor: the anchor and positive halves
+        # and the in-batch accuracy are all reported, and calling `.backward()` on the
+        # record is the error a caller makes when they have not read the signature.
+        loss.total.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
 
         if done % max(1, steps // 10) == 0:
-            log(f"  step {done:>6}  infonce {loss.item():.4f}")
+            log(f"  step {done:>6}  infonce {loss.total.item():.4f}  "
+                f"accuracy {loss.accuracy.item():.3f}  temperature {loss.temperature:.4f}")
 
     encoder.eval()
     return encoder.state_dict()
+
+
+@torch.no_grad()
+def retrieval_over_judgements(
+    embed,
+    judgements,
+    *,
+    batch_size: int = 8,
+    max_bytes: int = 512,
+) -> dict[str, float]:
+    """Retrieval metrics over a judgement set whose queries each have their own pool.
+
+    ``embed(texts) -> [n, d]``. Each query is ranked only against its own candidates,
+    which is the decision the judgements were authored to describe. Chance is reported
+    alongside, because a mean over pools of different sizes has no single chance level and
+    a number without one cannot be read.
+    """
+    totals: dict[str, float] = {}
+    queries = list(judgements.queries)
+
+    # Candidates are pooled by text before embedding: the same candidate string is
+    # embedded once and reused, and the number of byte-level forward passes is bounded by
+    # the distinct strings rather than by decisions times candidates.
+    unique: dict[str, int] = {}
+    for pool in judgements.candidates:
+        for candidate in pool:
+            unique.setdefault(candidate, len(unique))
+    candidate_texts = list(unique)
+
+    def embed_all(texts: list[str]) -> Tensor:
+        rows = []
+        for start in range(0, len(texts), batch_size):
+            rows.append(embed(texts[start : start + batch_size]))
+        return torch.cat(rows) if rows else torch.empty(0)
+
+    query_vectors = embed_all(queries)
+    candidate_vectors = embed_all(candidate_texts)
+
+    for index, pool in enumerate(judgements.candidates):
+        columns = [unique[candidate] for candidate in pool]
+        metrics = retrieval_metrics(
+            query_vectors[index : index + 1],
+            candidate_vectors[columns],
+            {0: judgements.relevant[index]},
+        )
+        for key, value in metrics.items():
+            totals[key] = totals.get(key, 0.0) + value
+
+    n = max(len(judgements), 1)
+    return {
+        **{key: value / n for key, value in totals.items()},
+        "n_decisions": len(judgements),
+        "chance_recall_at_1": judgements.chance_recall_at_1,
+    }
 
 
 def retrieval_metrics(

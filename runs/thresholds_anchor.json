@@ -1,0 +1,31 @@
+{
+  "architecture": "checkpoint",
+  "budget": 128,
+  "eval_texts": 64,
+  "max_bytes": 512,
+  "random_init": {
+    "anisotropy": 0.6096550822257996,
+    "boundary_acc": 0.5968810797665369,
+    "cos@7": null,
+    "cos_emb_c": 0.02017727494239807,
+    "cos_emb_raw": 0.5608761310577393,
+    "eval_n": 64,
+    "nn_agree": 0.03125,
+    "nn_chance": 0.015873015873015872,
+    "sim_corr": 0.07263930886983871
+  },
+  "source_id": "jhu-clsp/ettin-encoder-17m",
+  "trained": {
+    "anisotropy": 0.9945517778396606,
+    "boundary_acc": 0.949142752918288,
+    "cos@7": null,
+    "cos_emb_c": 0.824006199836731,
+    "cos_emb_raw": 0.9935054779052734,
+    "eval_n": 64,
+    "nn_agree": 0.296875,
+    "nn_chance": 0.015873015873015872,
+    "sim_corr": 0.6290120482444763
+  },
+  "trie_coverage": 1.0,
+  "vocab_strategy": "bytelevel"
+}

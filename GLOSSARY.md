@@ -35,6 +35,18 @@ The terminal deliverable of a byteification: a byte-native encoder graph with a 
 and a fixed patch budget, deployable without a source tokenizer. _Avoid_: model, checkpoint,
 export
 
+**Floor**:
+A published, measured minimum that an artifact must clear to be accepted, published per source
+model as data. A floor that a randomly initialised byte interface could clear is not a floor,
+and one that identical reruns fail half the time is a coin flip. _Avoid_: threshold,
+hyperparameter, target
+
+**Judgement pool**:
+The candidates a relevance judgement supplies alongside its query — the documents that query is
+meant to be ranked against. Ranking within a query's own pool, rather than against a whole
+corpus, is what makes the chance level `1/k` and therefore comparable between two artifacts
+fitted to different corpora. _Avoid_: corpus, candidate set, negatives
+
 ## The retrofit
 
 **Byteification**:
@@ -182,8 +194,10 @@ _Avoid_: shared direction (that is the symptom; this is the property)
 
 **Centred cosine**:
 Cosine similarity computed after removing the corpus mean, so it responds to the component
-that discriminates rather than the one every vector shares.
-_Avoid_: raw cosine, plain cosine
+that discriminates rather than the one every vector shares. The mean is over the whole
+evaluation set: removing the dominant direction means subtracting the population mean, and a
+batch of four does not estimate one, so a metric centred per batch scores the same checkpoint
+differently at batch 4 and at batch 16. _Avoid_: raw cosine, plain cosine
 
 **Similarity-matrix correlation**:
 Correlation between two models' pairwise cosine matrices — whether they rank documents the

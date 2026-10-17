@@ -1,0 +1,89 @@
+{
+  "ladder": [
+    {
+      "both": true,
+      "boundary_acc": 0.9960982747058464,
+      "cos_emb_c": 0.8892174959182739,
+      "level1_holds": true,
+      "lr": 0.0,
+      "mrr": 0.6972098443223437,
+      "recall@1": 0.4875,
+      "retrieval_floor_reached": true,
+      "sim_corr": 0.9851343631744385,
+      "steps": 0
+    },
+    {
+      "both": false,
+      "boundary_acc": 0.8670060354813144,
+      "cos_emb_c": 0.5727342367172241,
+      "level1_holds": false,
+      "lr": 0.0001,
+      "mrr": 0.7262961538461536,
+      "recall@1": 0.5235,
+      "retrieval_floor_reached": true,
+      "sim_corr": 0.9469220042228699,
+      "steps": 1500
+    },
+    {
+      "both": false,
+      "boundary_acc": 0.9141315612997623,
+      "cos_emb_c": 0.5432836413383484,
+      "level1_holds": false,
+      "lr": 0.0001,
+      "mrr": 0.5986378205128213,
+      "recall@1": 0.273,
+      "retrieval_floor_reached": false,
+      "sim_corr": 0.9294589161872864,
+      "steps": 500
+    },
+    {
+      "both": false,
+      "boundary_acc": 0.9671096750594403,
+      "cos_emb_c": 0.5948724746704102,
+      "level1_holds": false,
+      "lr": 0.0001,
+      "mrr": 0.6108672619047618,
+      "recall@1": 0.2905,
+      "retrieval_floor_reached": false,
+      "sim_corr": 0.9489263296127319,
+      "steps": 150
+    },
+    {
+      "both": false,
+      "boundary_acc": 0.9910687069438517,
+      "cos_emb_c": 0.7721480131149292,
+      "level1_holds": false,
+      "lr": 2e-05,
+      "mrr": 0.6162849206349207,
+      "recall@1": 0.2985,
+      "retrieval_floor_reached": false,
+      "sim_corr": 0.9869586229324341,
+      "steps": 1500
+    },
+    {
+      "both": false,
+      "boundary_acc": 0.9953057367554715,
+      "cos_emb_c": 0.806043267250061,
+      "level1_holds": true,
+      "lr": 2e-05,
+      "mrr": 0.6139541666666666,
+      "recall@1": 0.2945,
+      "retrieval_floor_reached": false,
+      "sim_corr": 0.9795927405357361,
+      "steps": 500
+    },
+    {
+      "both": false,
+      "boundary_acc": 0.9960982747058464,
+      "cos_emb_c": 0.8468217849731445,
+      "level1_holds": true,
+      "lr": 2e-05,
+      "mrr": 0.6107565934065936,
+      "recall@1": 0.295,
+      "retrieval_floor_reached": false,
+      "sim_corr": 0.9846190810203552,
+      "steps": 150
+    }
+  ],
+  "model": "hotchpotch/bekko-system-one-v0-17m"
+}

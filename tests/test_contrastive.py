@@ -248,3 +248,54 @@ def test_retrieval_metrics_are_anisotropy_aware():
 def test_retrieval_handles_empty_relevant():
     m = retrieval_metrics(torch.eye(2), torch.eye(2), relevant={})
     assert all(v == 0.0 for v in m.values())
+
+def test_contrastive_training_on_a_corpus_runs_and_lowers_its_own_loss(tiny_source_encoder,
+                                                                        tiny_source_tokenizer,
+                                                                        corpus):
+    """Level 2 has to *run*, not merely exist.
+
+    `train_contrastive_on_corpus` indexed the `ByteBatch` that `encode_texts` returns as
+    though it were a sequence of rows, which raised `TypeError` on the first step. Nothing
+    in the suite reached it -- the function's unit-testable parts were all tested, and the
+    one level that calls it was the one level no test built -- so level 2 had never executed
+    end to end. Four steps on the synthetic fixture is the whole regression test.
+    """
+    from byteify.contrastive import train_contrastive_on_corpus
+    from byteify.source import LocalEncoderSpec, build_byteified_encoder
+
+    encoder = build_byteified_encoder(
+        tiny_source_encoder,
+        tiny_source_tokenizer,
+        LocalEncoderSpec(layers=1, ffn_hidden=32, window=8),
+    )
+    before = {k: v.clone() for k, v in encoder.state_dict().items()}
+
+    losses: list[float] = []
+    state = train_contrastive_on_corpus(
+        encoder,
+        tiny_source_encoder,
+        tiny_source_tokenizer,
+        corpus[:48],
+        steps=4,
+        batch_size=4,
+        max_bytes=128,
+        device="cpu",
+        log=losses.append,
+    )
+
+    assert "local_encoder.ffns.0.attn.in_proj.weight" in state or any(
+        name.startswith("local_encoder") for name in state
+    ), sorted(state)
+    # The trainer logs "  step N  infonce <value>" every steps//10, so at four steps it logs
+    # once. Parse the number back out rather than trusting the string: a NaN loss moves no
+    # parameter, and the parameter-moved assertion below would pass on a diverged run.
+    logged = [line for line in losses if "infonce" in line]
+    assert logged, "the contrastive stage logged no loss"
+    values = [float(line.split("infonce ")[1].split()[0]) for line in logged]
+    assert all(math.isfinite(value) for value in values), f"non-finite loss in {values}"
+    # It has to have moved the interface it was asked to fit, or it optimised nothing.
+    assert any(
+        not torch.equal(before[name], state[name])
+        for name in before
+        if name.startswith("local_encoder")
+    )

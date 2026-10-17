@@ -118,7 +118,10 @@ def test_only_measured_source_models_have_published_floors():
     someone else's floors across architectures, which is the thing per-model thresholds
     exist to prevent.
     """
-    assert published_source_ids() == ["jhu-clsp/ettin-encoder-17m"]
+    assert published_source_ids() == [
+        "hotchpotch/bekko-system-one-v0-17m",
+        "jhu-clsp/ettin-encoder-17m",
+    ]
     for model_id in (
         "sentence-transformers/all-MiniLM-L6-v2",
         "bert-base-uncased",
@@ -130,16 +133,110 @@ def test_only_measured_source_models_have_published_floors():
             thresholds_for(model_id)
 
 
-def test_the_anchor_floors_sit_below_what_was_observed_and_above_a_random_interface():
-    """The floors have to be reachable by a real run and unreachable by an untrained one."""
-    observed = {"cos_emb_c": 0.841, "sim_corr": 0.717, "boundary_acc": 0.944}
-    untrained = {"cos_emb_c": -0.005, "sim_corr": 0.241, "boundary_acc": 0.228}
-    thresholds = thresholds_for("jhu-clsp/ettin-encoder-17m")
+#: What each published model was measured at, and what an untrained byte interface scores
+#: on the same texts. A floor has to be reachable by a real run and out of reach of an
+#: untrained one; if it is not one of those, it certifies nothing.
+PUBLISHED_MEASUREMENTS = {
+    "jhu-clsp/ettin-encoder-17m": {
+        "observed": {"cos_emb_c": 0.824, "sim_corr": 0.629, "boundary_acc": 0.949},
+        "untrained": {"cos_emb_c": 0.020, "sim_corr": 0.073, "boundary_acc": 0.597},
+    },
+    "hotchpotch/bekko-system-one-v0-17m": {
+        "observed": {"cos_emb_c": 0.889, "sim_corr": 0.985, "boundary_acc": 0.996},
+        "untrained": {"cos_emb_c": 0.078, "sim_corr": 0.949, "boundary_acc": 0.671},
+    },
+}
+
+
+@pytest.mark.parametrize("model_id", sorted(PUBLISHED_MEASUREMENTS))
+def test_every_published_floor_sits_below_what_was_observed_and_above_an_untrained_model(
+    model_id,
+):
+    """The property that makes a floor a floor rather than a decoration."""
+    observed = PUBLISHED_MEASUREMENTS[model_id]["observed"]
+    untrained = PUBLISHED_MEASUREMENTS[model_id]["untrained"]
+    thresholds = thresholds_for(model_id)
 
     for name, measured in observed.items():
         floor = getattr(thresholds, name)
         assert floor < measured, f"{name} floor {floor} is above the observed {measured}"
         assert floor > untrained[name], f"{name} floor {floor} would admit an untrained model"
+
+
+def test_no_source_model_publishes_a_retrieval_floor_yet():
+    """Judgements are supplied so the level-2 check can fail; it must be able to fail.
+
+    Neither published model has one. On `ettin-encoder-17m` no retrieval judgement set has
+    been measured at all; on `bekko-system-one-v0-17m` the measurement was made and
+    withdrawn, because three runs of one Stage 1 recipe scored recall@1 0.488, 0.301 and
+    0.281 on the same 2000 decisions. A floor that half of identical runs fail is a coin
+    flip, and a coin flip presented as a guarantee is worse than no guarantee.
+    """
+    from byteify.gates import require_retrieval_floor
+
+    for model_id in published_source_ids():
+        thresholds = thresholds_for(model_id)
+        assert thresholds.retrieval_recall_at_1 == 0.0, (
+            f"{model_id} publishes a retrieval floor; if one has been measured, record it "
+            "here with the run-to-run spread that justifies the margin"
+        )
+        with pytest.raises(ValueError) as excinfo:
+            require_retrieval_floor(model_id, thresholds)
+        assert "no published retrieval floor" in str(excinfo.value)
+        assert "thresholds.json" in str(excinfo.value)
+
+
+def test_a_published_retrieval_floor_would_be_allowed_through():
+    """The refusal is about an absent measurement, not a prohibition."""
+    from byteify.gates import require_retrieval_floor
+
+    require_retrieval_floor("synthetic", Thresholds(source_id="synthetic",
+                                                    retrieval_recall_at_1=0.45))
+
+
+def test_retrieval_gate_passes_a_perfect_ranking_and_fails_a_reversed_one(tiny_source_encoder,
+                                                                          tiny_source_tokenizer):
+    """The check has to be able to fail in both directions, or it is a decoration."""
+    from byteify.gates import check_retrieval
+    from byteify.training import Judgements
+
+    judgements = Judgements(
+        queries=["byte stream", "patch budget", "gate threshold"],
+        candidates=[["one", "two", "three"]] * 3,
+        relevant=[[0], [1], [2]],
+    )
+    thresholds = Thresholds(source_id="synthetic", retrieval_recall_at_1=0.9)
+    vectors = {
+        "byte stream": [1.0, 0.0, 0.0], "one": [1.0, 0.0, 0.0],
+        "patch budget": [0.0, 1.0, 0.0], "two": [0.0, 1.0, 0.0],
+        "gate threshold": [0.0, 0.0, 1.0], "three": [0.0, 0.0, 1.0],
+    }
+
+    def embed(permutation):
+        def embed_texts(texts):
+            return torch.tensor([vectors[permutation.get(t, t)] for t in texts])
+
+        return embed_texts
+
+    report = GateReport()
+    metrics = check_retrieval(report, embed=embed({}), judgements=judgements,
+                              thresholds=thresholds)
+    assert metrics["recall@1"] == 1.0
+    assert metrics["chance_recall_at_1"] == pytest.approx(1 / 3)
+    assert report.passed
+
+    # Every gold candidate moved off its query's direction: the metric must fall to zero
+    # and the gate must fail. A check that cannot fail here cannot fail anywhere.
+    failing = GateReport()
+    inverted = check_retrieval(
+        failing,
+        embed=embed({"one": "two", "two": "three", "three": "one"}),
+        judgements=judgements,
+        thresholds=thresholds,
+    )
+    assert inverted["recall@1"] == 0.0
+    assert not failing.passed
+    assert failing.checks[0].name == "retrieval_recall_at_1"
 
 
 # -- a gate that fails fails ----------------------------------------------

@@ -362,6 +362,33 @@ def test_a_manifest_that_is_not_json_says_so(tmp_path: Path):
         Manifest.from_file(path)
 
 
+def test_the_manifest_states_whether_it_is_tokenizer_free(valid_manifest: Manifest):
+    """The README points at `byte_stream.tokenizer_free`; it has to be there.
+
+    Whether an artifact can be served with no tokenizer present is the difference between a
+    byte-native artifact and one that is not, and it was a property that existed in code and
+    was never written to the manifest -- so the key the documentation named was absent from
+    every artifact produced.
+    """
+    from dataclasses import replace
+
+    from byteify.bytestream import ByteStreamRule
+
+    for name, expected in (("nfc", True), ("raw-utf8", True), ("normalised", False)):
+        manifest = replace(
+            valid_manifest,
+            byte_stream=ByteStreamRule(
+                rule=name, family="bytelevel", n_byte_values=263,
+                open_pseudo=256, close_pseudo=257, pseudo_bytes={256: 0, 257: 1},
+            ).to_dict(),
+        )
+        assert manifest.to_dict()["byte_stream"]["tokenizer_free"] is expected
+        # And it survives the round trip, rather than being recomputed by the reader.
+        restored = Manifest.from_json(manifest.to_json())
+        assert restored.to_dict()["byte_stream"]["tokenizer_free"] is expected
+        assert restored.stream_rule().tokenizer_free is expected
+
+
 # -- round trip -----------------------------------------------------------
 
 

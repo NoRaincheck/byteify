@@ -89,27 +89,36 @@ result quoted as raw cosine as unverified.
 ## Reusability
 
 Pointing byteify at a different embedding model is a configuration change. Verified across
-six models spanning two architectures and three tokenizer families:
+seven models spanning two architectures and three tokenizer families:
 
 **Alignment is lossless for all three families**, verified byte for byte against the training
 path. That is a claim about alignment, not about quality — and it is not the same as being
-buildable. Only `jhu-clsp/ettin-encoder-17m` has published fidelity floors, so only it can be
-built today; the other five are **alignment-verified but refused by `byteify build`**,
-because fidelity numbers do not transfer between architectures and borrowing the anchor's
-would be the same error as hardcoding them.
+buildable. Two source models have published fidelity floors, `jhu-clsp/ettin-encoder-17m` and
+`hotchpotch/bekko-system-one-v0-17m`, so only those two can be built today; the other five are
+**alignment-verified but refused by `byteify build`**, because fidelity numbers do not transfer
+between architectures and borrowing another model's would be the same error as hardcoding them.
 
-| model | arch | tokenizer | params | gated |
-| --- | --- | --- | --- | --- |
-| `jhu-clsp/ettin-encoder-17m` | ModernBERT | byte-level BPE | 16.8M | yes |
-| `jhu-clsp/ettin-encoder-32m` | ModernBERT | byte-level BPE | 31.9M | no |
-| `answerdotai/ModernBERT-base` | ModernBERT | byte-level BPE | 149M | no |
-| `sentence-transformers/all-MiniLM-L6-v2` | BERT | WordPiece | 22.7M | no |
-| `bert-base-uncased` | BERT | WordPiece | 110M | no |
-| `xlm-roberta-base` | RoBERTa | SentencePiece | 278M | no |
+| model | arch | tokenizer | params | gated | buildable |
+| --- | --- | --- | --- | --- | --- |
+| `jhu-clsp/ettin-encoder-17m` | ModernBERT | byte-level BPE | 16.8M | yes | yes |
+| `jhu-clsp/ettin-encoder-32m` | ModernBERT | byte-level BPE | 31.9M | no | no |
+| `answerdotai/ModernBERT-base` | ModernBERT | byte-level BPE | 149M | no | no |
+| `sentence-transformers/all-MiniLM-L6-v2` | BERT | WordPiece | 22.7M | no | no |
+| `bert-base-uncased` | BERT | WordPiece | 110M | no | no |
+| `xlm-roberta-base` | RoBERTa | SentencePiece | 278M | no | no |
+| `hotchpotch/bekko-system-one-v0-17m` | ModernBERT | byte-level BPE | 16.8M | no | yes |
+
+The last row is **not an embedding model**: it is a typed-decision model, and it ships as a
+custom-code sentence-transformers repository rather than a plain checkpoint, so `AutoModel`
+cannot open it. Both layouts resolve to the same encoder and tokenizer — see
+[ADR 0012](docs/adr/0012-source-models-that-are-not-plain-checkpoints.md) — and
+[`RESULTS.md`](RESULTS.md) §10.5 records what byteifying it cost, including a level-2 result
+that came out negative.
 
 To make one buildable, train it and publish its measured floors in
 [`src/byteify/assets/thresholds.json`](src/byteify/assets/thresholds.json). It is data
 precisely so that adding a model is a measurement rather than a decision.
+`scripts/measure_thresholds.py` is that measurement.
 
 Two caveats survive, and the manifest records both rather than hiding them:
 
@@ -120,6 +129,111 @@ Two caveats survive, and the manifest records both rather than hiding them:
   normalisers rewrite text before tokenising it, so reproducing the training stream means
   reproducing the normaliser. The manifest declares which rule an artifact was built for
   and `byte_stream.tokenizer_free` says whether the tokenizer-free claim holds for it.
+
+## Running a byteified artifact
+
+An artifact is a directory. `byteify encode` takes that directory and nothing else — no
+config, no checkpoint path, no tokenizer. The source *model* is still fetched, because a
+byteified encoder delegates its patch representations to the frozen encoder it was distilled
+from; that delegation is what level 1's guarantee is.
+
+```bash
+uv sync --extra onnx
+uv run byteify encode ./artifact --text "the quick brown fox"
+uv run byteify encode ./artifact --file docs.txt --similarity   # blank line between paragraphs
+uv run byteify encode ./artifact --onnx --text "the quick brown fox"   # the exported graph
+uv run byteify inspect ./artifact                                # what it promised, and whether it held
+```
+
+Longer input fails rather than truncating, because an artifact's byte axis is fixed when it
+is built and a serving path that quietly embedded a prefix would be worse than one that
+refuses:
+
+```
+error: text needs 602 bytes but this artifact's byte axis is 512. It was built with
+--max-bytes 512 and cannot take longer input; rebuild it with a larger axis rather than have
+text silently truncated.
+```
+
+### The byteified `bekko-system-one-v0-17m`
+
+A gated level-1 artifact for a typed-decision model, built and verified offline. `RESULTS.md`
+§10.5 has the measurements and one negative result; the commands are:
+
+```bash
+# 1. the workload, rendered in the model's own prompt layout (public data, one time)
+uv run --with pyarrow python scripts/prepare_decision_corpus.py \
+    --train-texts 20000 --judgement-decisions 2000
+
+# 2. the artifact: Stage 1, gates, graph export. ~8 minutes on an M1 Max.
+HF_HUB_OFFLINE=1 uv run byteify build \
+    --model hotchpotch/bekko-system-one-v0-17m --level faithful \
+    --data data/corpus/open-jev-train.jsonl \
+    --out artifacts/bekko-17m-faithful \
+    --steps 6000 --batch-size 4 --max-bytes 512 --patch-budget 128
+
+# 3. serve it, with no tokenizer in the path
+HF_HUB_OFFLINE=1 uv run byteify encode artifacts/bekko-17m-faithful \
+    --text "Candidate: billing: Charges, invoices, refunds"
+```
+
+```
+byteify faithful: hotchpotch/bekko-system-one-v0-17m
+  source layout: module (0_BekkoInference)
+  6 checkpoint tensor(s) are not encoder weights and were not loaded: ['heads.choice.bias', …]
+gates
+  ok   byte_stream_lossless              0 <= 0
+  ok   cos_emb_c                   0.91261 >= 0.8
+  ok   sim_corr                    0.97981 >= 0.97
+  ok   boundary_acc                0.99604 >= 0.99
+  ok   trie_coverage                     1 >= 0.99
+  onnx vs eager: max |diff| 1.37e-06
+```
+
+Two things to know before reading anything into it. Its **byte axis is 512 bytes**, and
+Open-Jev decision queries have a median of 530 bytes — so half of them are truncated at
+serving time, which is a property of the artifact, not of the model. And its tokenizer is
+**byte-identical to the anchor's**, so `manifest.byte_stream.tokenizer_free` is `true`: no
+tokenizer is needed, and no normaliser has to be reproduced.
+
+Its three decision heads (`choice`, `noul`, `score`) are **not** in the artifact. It ships
+the encoder and its pooled representation, which is what those heads read; grading it as a
+decision model means attaching the source model's heads, which
+`scripts/decision_harness.py` does:
+
+```bash
+uv run --with sentence-transformers --with pyarrow python scripts/decision_harness.py \
+    --artifact artifacts/bekko-17m-faithful \
+    --judgements data/judgements/open-jev-validation.jsonl --limit 150
+```
+
+```
+kind       n  chance   source  src@axis  byteified   agree  meanTV
+choice    37   0.323    0.622     0.595      0.270   0.216   0.259
+noul      95   0.500    0.568     0.505      0.400   0.747   0.228
+score     18   0.259    0.778     0.722      0.056   0.111   0.491
+all      150   0.428    0.607     0.553      0.327   0.540   0.267
+```
+
+The harness runs the model's **own** decision path — cross-attention over a shared query
+prefix, then per-task heads — and refuses to report byteified numbers unless its own source
+path reproduces the model's `predict_groups` to within `--tolerance` (it does, to 1.5e-06).
+`src@axis` is the truncation control: the same model on the bytes the artifact's axis can
+hold. It costs 0.054, so the byteified column's 0.607 → 0.327 is byteification, not the
+axis.
+
+Reproducing the floors behind it:
+
+```bash
+HF_HUB_OFFLINE=1 uv run python scripts/measure_thresholds.py \
+    --model hotchpotch/bekko-system-one-v0-17m \
+    --data data/corpus/open-jev-train.jsonl --checkpoint runs/stage1_bekko/stage1.pt \
+    --judgements data/judgements/open-jev-validation.jsonl --out runs/thresholds_bekko.json
+HF_HUB_OFFLINE=1 uv run python scripts/contrastive_tradeoff.py \
+    --model hotchpotch/bekko-system-one-v0-17m --checkpoint runs/stage1_bekko/stage1.pt \
+    --data data/corpus/open-jev-train.jsonl \
+    --judgements data/judgements/open-jev-validation.jsonl
+```
 
 ## Further reading
 
@@ -132,11 +246,15 @@ Two caveats survive, and the manifest records both rather than hiding them:
 
 ```bash
 uv sync --extra dev --extra onnx
-HF_HUB_OFFLINE=1 uv run pytest -q      # 272 tests, offline, ~2 min
+HF_HUB_OFFLINE=1 uv run pytest -q      # 299 tests, offline, ~2 min
 uv run ruff check .
 ```
 
 Research scripts live in `scripts/` and are not part of the documented surface; they run the
 same code paths as the command. `scripts/prepare_corpus.py` fetches the corpus the
-experiments use. Everything runs from the local HuggingFace cache; `HF_HUB_OFFLINE=1` is set
+experiments use, and `scripts/prepare_decision_corpus.py` renders a typed-decision dataset
+into reference texts and judgements in the model's own prompt layout.
+`scripts/measure_thresholds.py` measures a source model's floors on the gate's own metric,
+and `scripts/contrastive_tradeoff.py` maps the fidelity-for-retrieval trade that level 2
+makes. Everything runs from the local HuggingFace cache; `HF_HUB_OFFLINE=1` is set
 throughout.

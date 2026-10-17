@@ -127,3 +127,18 @@ def test_the_readme_leads_with_the_command():
     first_command = readme.index("byteify build")
     assert first_command < 2000, "the command appears too far into the README"
     assert readme.lstrip().startswith("# byteify")
+
+def test_a_documented_script_is_exercised_by_something_beyond_its_help():
+    """`--help` proves a script parses. It does not prove the path it drives runs.
+
+    Two scripts in this repository were reachable only through `--help` and both had a
+    defect on the first line of real work: `train_stage1.py` could not resolve a
+    custom-code module repository, and `contrastive_tradeoff.py` calls the contrastive
+    stage. Both are listed in RESULTS.md as measurements, so RESULTS.md must also record
+    what running them produced -- otherwise the same class of bug arrives again through a
+    different entry point.
+    """
+    results = (REPO / "RESULTS.md").read_text(encoding="utf-8")
+    for script in ("measure_thresholds.py", "contrastive_tradeoff.py",
+                   "prepare_decision_corpus.py", "decision_harness.py"):
+        assert script in results, f"{script} is documented but RESULTS.md records no run of it"

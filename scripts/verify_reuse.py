@@ -16,9 +16,9 @@ import argparse
 import gc
 
 import torch
-from transformers import AutoModel, AutoTokenizer
 
 from byteify.alignment import align_text, discover_special_bytes
+from byteify.hub import resolve_source_model, resolve_source_tokenizer
 from byteify.source import (
     HuggingFaceSourceEncoder,
     LocalEncoderSpec,
@@ -36,6 +36,14 @@ SAMPLES = [
     "DNA: ACGTACGTNNNN and protein MKWVTFISLLLLF",
     "emoji 🙂🎉 inline",
     "   multiple   spaces   ",
+    # A typed-decision model's inputs, rendered the way it renders them. A source model
+    # that is not an embedding model still has a workload, and byteifying it without
+    # text of that shape would be measuring a workload nobody serves.
+    (
+        "Instruction: Which department should handle this request?\n"
+        'State: {"message": "I was charged twice for the same order."}'
+    ),
+    "Candidate: billing: Charges, invoices, refunds",
 ]
 
 DEFAULT_MODELS = [
@@ -45,6 +53,7 @@ DEFAULT_MODELS = [
     "sentence-transformers/all-MiniLM-L6-v2",
     "bert-base-uncased",
     "xlm-roberta-base",
+    "hotchpotch/bekko-system-one-v0-17m",
 ]
 
 
@@ -55,7 +64,7 @@ def check_tokenizer_level(model_id: str) -> dict[str, object]:
     aligning the byte stream. It needs no weights, so it works offline even when a
     model's weights are not cached.
     """
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = resolve_source_tokenizer(model_id)
     resolution = resolve_token_bytes(tokenizer)
     trie, _ = build_suffix_trie(tokenizer)
     specials = discover_special_bytes(tokenizer)
@@ -85,8 +94,11 @@ def check_tokenizer_level(model_id: str) -> dict[str, object]:
 
 
 def check(model_id: str, device: str) -> dict[str, object]:
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    source = HuggingFaceSourceEncoder(AutoModel.from_pretrained(model_id)).to(device).eval()
+    tokenizer = resolve_source_tokenizer(model_id)
+    resolved = resolve_source_model(model_id)
+    source = HuggingFaceSourceEncoder(
+        resolved.model, model_id=model_id, layout=resolved.layout
+    ).to(device).eval()
     resolution = resolve_token_bytes(tokenizer)
     _, _ = build_suffix_trie(tokenizer)
     specials = discover_special_bytes(tokenizer)

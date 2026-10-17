@@ -24,9 +24,9 @@ import time
 from pathlib import Path
 
 import torch
-from transformers import AutoModel, AutoTokenizer
 
 from byteify.data import iter_texts
+from byteify.hub import resolve_source_model, resolve_source_tokenizer
 from byteify.source import HuggingFaceSourceEncoder, LocalEncoderSpec, build_byteified_encoder
 from byteify.training import Stage1Config, save_checkpoint, train_stage1
 
@@ -67,9 +67,10 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = args.device
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = resolve_source_tokenizer(args.model)
+    resolved = resolve_source_model(args.model)
     source = HuggingFaceSourceEncoder(
-        AutoModel.from_pretrained(args.model), model_id=args.model
+        resolved.model, model_id=args.model, layout=resolved.layout
     ).to(device)
     source.eval()
     for p in source.parameters():
@@ -84,6 +85,9 @@ def main() -> None:
     )
     print(f"source: {sum(p.numel() for p in source.parameters()) / 1e6:.2f}M params, "
           f"d_model={source.d_model}, layers={source.n_layers}, family={source.family}")
+    if resolved.layout != "checkpoint":
+        print(f"source layout: {resolved.layout} ({resolved.module_path}); "
+              f"{len(resolved.dropped)} non-encoder tensor(s) not loaded")
     print(f"byte interface: {spec.layers}x{spec.backend} ffn={spec.ffn_hidden} "
           f"window={spec.window}, boundary={spec.boundary_predictor}")
 
