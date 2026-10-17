@@ -112,6 +112,25 @@ class ByteStreamRule:
         )
 
 
+def fits_byte_axis(rule: ByteStreamRule, text: str, width: int) -> int:
+    """How many bytes ``text`` needs on ``rule``, raising if it will not fit.
+
+    The serving contract (ADR 0002) is that the byte axis is fixed, so input longer than it
+    is refused rather than truncated. :meth:`ByteStreamRule.build` truncates, because a
+    construction rule that refused would make the training path unable to prepare batches
+    at all -- so the refusal lives here and every serving path calls it *before* building.
+    """
+    overhead = (rule.open_pseudo >= 0) + (rule.close_pseudo >= 0)
+    needed = len(rule.content(text)) + overhead
+    if needed > width:
+        raise ValueError(
+            f"text needs {needed} bytes but this artifact's byte axis is {width}. "
+            f"It was built with --max-bytes {width} and cannot take longer input; "
+            f"rebuild it with a larger axis rather than have text silently truncated."
+        )
+    return needed
+
+
 def rule_for_family(
     family: str,
     *,

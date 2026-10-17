@@ -163,20 +163,18 @@ def _onnx_inputs(manifest, artifact: Path, text: str, args: argparse.Namespace) 
     """Build the graph's three inputs with no tokenizer, from the artifact alone."""
     import numpy as np
 
+    from .bytestream import fits_byte_axis
     from .expand import ByteTrie, expand_byte_ids
     from .manifest import read_trie
 
     rule = manifest.stream_rule()
     trie = ByteTrie(read_trie(artifact / manifest.trie.path))
-    byte_ids = rule.build(text, args.max_bytes or manifest.max_bytes)
+    # Refuse before building, not after: `rule.build` truncates, and a serving path that
+    # truncated would quietly embed a prefix of the document.
+    fits_byte_axis(rule, text, manifest.max_bytes)
+    byte_ids = rule.build(text, manifest.max_bytes)
     expanded = expand_byte_ids(byte_ids, trie, pseudo_byte_to_token=rule.pseudo_bytes)
     width = manifest.max_bytes
-    if len(byte_ids) > width:
-        raise ValueError(
-            f"text needs {len(byte_ids)} bytes but the artifact's byte axis is {width}. "
-            f"This artifact was built with --max-bytes {width} and cannot take longer "
-            f"input; rebuild it with a larger axis rather than have text truncated."
-        )
 
     def pad(values, fill):
         return np.pad(

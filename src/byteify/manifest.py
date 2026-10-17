@@ -108,15 +108,27 @@ class TrieRef:
 
 @dataclass(frozen=True, slots=True)
 class GateResults:
-    """Numerical quality gates, and the thresholds they were judged against (ADR 0010)."""
+    """Numerical quality gates, the thresholds used, and what the level claims.
+
+    The level and its guarantee live here rather than beside it: a reviewer reading an
+    artifact needs to see what it promised and whether it held in one place, and a field
+    that is not in this dataclass is a field that is silently dropped on the way to disk.
+    """
 
     cos_emb: float | None = None
     sim_corr: float | None = None
     boundary_acc: float | None = None
     nn_agree: float | None = None
     onnx_max_abs_diff: float | None = None
+    outputs_finite: float | None = None
     retrieval: float | None = None
+    byte_stream_mismatches: int | None = None
+    checks: dict[str, float] = field(default_factory=dict)
     thresholds: dict[str, float] = field(default_factory=dict)
+    level: str = ""
+    guarantee: str = ""
+    declared: dict[str, Any] = field(default_factory=dict)
+    fidelity: dict[str, Any] = field(default_factory=dict)
     gate_passed: bool = True
 
     def to_dict(self) -> dict[str, Any]:

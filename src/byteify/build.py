@@ -30,7 +30,7 @@ from .gates import (
     thresholds_for,
 )
 from .levels import declare, resolve_level
-from .manifest import Manifest, export_artifact, measure_trie_coverage
+from .manifest import GateResults, Manifest, export_artifact, measure_trie_coverage
 
 #: Bolmo's compression ratio on English prose. Used to fit a patch budget to a byte axis;
 #: see `_fit_patch_budget`.
@@ -245,9 +245,10 @@ def build_artifact(
     # The graph is traced at, and then verified against, the same inputs. Built here and
     # moved onto the model's device: `export_onnx` would otherwise build its own example on
     # CPU, and the dynamo exporter rejects a graph with tensors on two devices.
-    graph_inputs = _example_inputs(
-        rule, trie, coverage_texts[:batch_size], max_bytes
-    ).to(device)
+    graph_inputs = tuple(
+        tensor.to(device)
+        for tensor in _example_inputs(rule, trie, coverage_texts[:batch_size], max_bytes)
+    )
 
     manifest = export_artifact(
         embedder,
@@ -271,11 +272,16 @@ def build_artifact(
         shutil.rmtree(output_dir)
         report.raise_if_failed()
 
-    manifest = Manifest.from_dict(
-        {**manifest.to_dict(), "gate": {**report.record(), **declare(
-            chosen, thresholds, report.extra.get("fidelity", metrics)
-        )}}
-    )
+    # The manifest records what the artifact promised and whether it held. Built through
+    # `GateResults` rather than merged as a loose dict, because a key that is not a declared
+    # field is a key that is silently dropped on the way to disk.
+    recorded = GateResults.from_dict({
+        **report.record(),
+        **declare(chosen, thresholds, report.extra.get("fidelity", metrics)),
+        "fidelity": report.extra.get("fidelity", {}),
+        "byte_stream_mismatches": report.extra.get("byte_stream_mismatches"),
+    })
+    manifest = Manifest.from_dict({**manifest.to_dict(), "gate": recorded.to_dict()})
     manifest.write_to(output_dir / "manifest.json")
 
     checkpoint.unlink(missing_ok=True)

@@ -95,13 +95,25 @@ class BatchSampler:
                     batches.append(chunk)
         self._rng.shuffle(batches)
 
-        for batch in batches:
-            texts = [self._prepare(self.texts[i]) for i in batch]
-            yield encode_texts(
-                texts,
-                self.tokenizer,
-                add_special_tokens=self.add_special_tokens,
+        if not batches:
+            # `epoch()` is unbounded -- callers loop it until their step budget is met --
+            # so an empty sampler would spin forever rather than report that it has no
+            # data. That is how a training loop hung on a corpus smaller than its own
+            # evaluation split.
+            raise ValueError(
+                f"no full batch of {self.batch_size} could be formed from "
+                f"{len(self.texts)} texts; supply more reference data or lower "
+                "--batch-size"
             )
+
+        while True:
+            for batch in batches:
+                texts = [self._prepare(self.texts[i]) for i in batch]
+                yield encode_texts(
+                    texts,
+                    self.tokenizer,
+                    add_special_tokens=self.add_special_tokens,
+                )
 
     def _prepare(self, text: str) -> str:
         return truncate_to_bytes(text, self.max_bytes)

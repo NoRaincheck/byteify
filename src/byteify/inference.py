@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .bytestream import fits_byte_axis
 from .expand import expand_byte_ids
 
 
@@ -187,6 +188,9 @@ class ByteifiedEmbedder(nn.Module):
                 "use encode(tokenizer, texts)"
             )
         limit = max_bytes or self.byte_axis
+        # Refuse rather than truncate: this is a serving path, and silently embedding a
+        # prefix of a document is worse than saying so.
+        fits_byte_axis(self.byte_stream_rule, text, limit)
         byte_ids = self.byte_stream_rule.build(text, limit)
         expanded = expand_byte_ids(
             byte_ids, self.byte_trie, pseudo_byte_to_token=self.byte_stream_rule.pseudo_bytes

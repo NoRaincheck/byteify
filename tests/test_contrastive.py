@@ -19,10 +19,36 @@ torch.manual_seed(0)
 
 
 def test_infonce_is_zero_when_anchor_equals_positive():
-    """The diagonal being perfectly correct is the global optimum."""
-    x = torch.randn(8, 16)
+    """The diagonal being perfectly correct is the global optimum.
+
+    Built from orthonormal vectors rather than random ones. With random 16-dimensional
+    vectors the off-diagonal cosines occasionally land near 1, and since the loss is
+    ``exp(diagonal - best_negative) / temperature`` with temperature 0.05, one such pair
+    lifts the loss to ~0.1. That is correct behaviour, not a defect -- but it made an
+    unseeded assertion on random data flaky.
+    """
+    vectors, _ = torch.linalg.qr(torch.randn(8, 16))
+    x = vectors[:, :8].contiguous()  # orthonormal, so every off-diagonal cosine is 0
+
     loss = infonce(x, x.clone(), temperature=0.05)
-    assert loss.total.item() < 1e-4
+    # 7 off-diagonal terms at exp(-1/0.05) each, halved for the symmetric direction.
+    assert loss.total.item() < 1e-8, loss.total.item()
+    assert loss.accuracy.item() == 1.0
+
+
+def test_infonce_rewards_a_known_positive_over_a_lookalike():
+    """A batch containing a near-duplicate of the anchor is the hard case, and the loss says so."""
+    torch.manual_seed(0)
+    anchor = torch.nn.functional.normalize(torch.randn(4, 16), dim=-1)
+    # A near-copy of row 0 must not win against the true positive.
+    anchor[1] = 0.999 * anchor[0] + 0.001 * torch.randn(16)
+    positive = anchor.clone()
+
+    loss = infonce(anchor, positive, temperature=0.05)
+    assert loss.total.item() > 0.0
+    # Row 1 is now a near-duplicate of row 0, so row 0's true positive is no longer the
+    # nearest and the loss cannot reach the optimum.
+    assert loss.total.item() > 1e-6, loss.total.item()
 
 
 def test_infonce_is_symmetric():

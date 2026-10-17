@@ -110,7 +110,17 @@ def train_stage1(
             "some out for evaluation. Run scripts/prepare_corpus.py, or pass more --data."
         )
 
-    eval_texts, train_texts = texts[: cfg.eval_texts], texts[cfg.eval_texts :]
+    # Hold out at most a quarter, and never the whole set. Taking a flat `eval_texts` slice
+    # silently consumed every text when the corpus was smaller than that default, leaving
+    # the sampler with nothing -- and `BatchSampler.epoch()` is an unbounded generator, so
+    # training spun forever rather than reporting that it had no data.
+    n_eval = min(cfg.eval_texts, max(1, len(texts) // 4))
+    eval_texts, train_texts = texts[:n_eval], texts[n_eval:]
+    if not train_texts:
+        raise ValueError(
+            f"reference data has {len(texts)} texts, all of which were held out for "
+            "evaluation; lower --eval-texts or supply more --data"
+        )
     sampler = BatchSampler(
         train_texts,
         tokenizer,
@@ -130,7 +140,7 @@ def train_stage1(
             add_special_tokens=True,
             device=device,
         )
-        for i in range(0, min(cfg.eval_texts, cfg.eval_batches * cfg.batch_size), cfg.batch_size)
+        for i in range(0, min(n_eval, cfg.eval_batches * cfg.batch_size), cfg.batch_size)
     ]
 
     depth = source.n_layers if cfg.stitch_depth < 0 else cfg.stitch_depth
