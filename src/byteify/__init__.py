@@ -28,6 +28,7 @@ from .alignment import (
     discover_special_bytes,
 )
 from .boundary_merge import bpe_merge_patches, merge_batch, merge_boundaries
+from .build import build_artifact
 from .bytestream import ByteStreamRule, rule_for_family
 from .contrastive import (
     ContrastiveHead,
@@ -39,6 +40,7 @@ from .contrastive import (
 )
 from .data import BatchSampler, iter_texts, truncate_to_bytes
 from .expand import ByteTrie, expand_byte_ids
+from .gates import Thresholds, resolve_thresholds, thresholds_for
 from .inference import (
     BudgetedPatches,
     ByteifiedEmbedder,
@@ -66,6 +68,7 @@ from .manifest import (
     export_artifact,
     load_artifact,
     manifest_from_checkpoint,
+    verify_artifact,
     write_trie,
 )
 from .model import (
@@ -83,6 +86,11 @@ from .model import (
     RMSNorm,
     patch_index,
     pool_patches,
+)
+from .sentence_transformers import (
+    Pipeline,
+    UnsupportedSentenceTransformer,
+    read_pipeline,
 )
 from .source import (
     ByteifyConfig,
@@ -131,11 +139,14 @@ __all__ = [
     "Manifest",
     "ManifestError",
     "PartialModernBert",
+    "Pipeline",
     "ProjectionHead",
     "RMSNorm",
     "SourceEncoder",
     "Stage1Weights",
+    "Thresholds",
     "UnsupportedSchemaVersion",
+    "UnsupportedSentenceTransformer",
     "VocabByteResolution",
     "align",
     "align_from_offsets",
@@ -144,6 +155,7 @@ __all__ = [
     "boundary_loss",
     "bpe_merge_patches",
     "budgeted_patches_mask",
+    "build_artifact",
     "build_byteified_encoder",
     "build_embedder_from_manifest",
     "build_encoder_from_dimensions",
@@ -173,7 +185,9 @@ __all__ = [
     "pool",
     "pool_budgeted_patches",
     "pool_patches",
+    "read_pipeline",
     "resolve_source_encoder",
+    "resolve_thresholds",
     "resolve_token_bytes",
     "retrieval_metrics",
     "rule_for_family",
@@ -182,7 +196,9 @@ __all__ = [
     "stitching_loss",
     "task_arithmetic_merge",
     "teacher_states",
+    "thresholds_for",
     "tokenizer_tables",
     "truncate_to_bytes",
+    "verify_artifact",
     "write_trie",
 ]

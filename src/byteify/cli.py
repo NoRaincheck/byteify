@@ -66,10 +66,11 @@ def cmd_build(args: argparse.Namespace) -> int:
             device=args.device,
             judgements=args.judgements,
             delta_from=args.delta_from,
+            thresholds=args.thresholds,
             dry_run=args.dry_run,
             quiet=args.quiet,
         )
-    except (KeyError, FileNotFoundError, ValueError, RuntimeError) as exc:
+    except (KeyError, FileNotFoundError, TypeError, ValueError, RuntimeError) as exc:
         _say(f"error: {exc}")
         return 1
 
@@ -82,6 +83,8 @@ def cmd_build(args: argparse.Namespace) -> int:
     _say(f"  source      {manifest.source_id}")
     _say(f"  byte axis   {manifest.max_bytes}, patch budget {manifest.budget}")
     _say(f"  byte stream {manifest.family} / {manifest.byte_stream_rule}")
+    _say(f"  embedding   pooling={manifest.pooling}, "
+         f"{'l2-normalised' if manifest.normalize else 'not normalised'}")
     if manifest.trie.coverage is not None:
         _say(f"  trie        {manifest.trie.entries} entries, "
              f"{manifest.trie.coverage * 100:.1f}% coverage")
@@ -254,6 +257,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="reference data: .txt, .json or .jsonl")
     build.add_argument("--judgements", default=None,
                        help="optional relevance judgements: .json or .jsonl")
+    build.add_argument("--thresholds", default=None, metavar="FILE",
+                       help="fidelity floors measured for THIS model, as a JSON object of "
+                            "threshold fields. Required for a model with no published "
+                            "entry in byteify/assets/thresholds.json; borrowing another "
+                            "model's floors is refused either way")
     build.add_argument("--out", required=True, help="artifact directory to write")
     build.add_argument("--steps", type=int, default=2000)
     build.add_argument("--batch-size", type=int, default=4)

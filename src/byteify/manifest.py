@@ -46,9 +46,15 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from .fidelity import SUPPORTED_POOLING
+
 # MAJOR.MINOR. A loader refuses a major it does not recognise rather than attempting a
 # best-effort load; MINOR is additive and must stay backward compatible.
-SCHEMA_VERSION: str = "1.0"
+# 1.1 adds ``pooling``, ``normalize``, ``source_pipeline``, ``recipe``, ``recipe_hash`` and
+# ``content_digest``. A reader that predates 1.1 ignores them and falls back to mean
+# pooling with L2 normalisation, which is what every manifest through 1.0 described -- so
+# 1.0 artifacts still load exactly as they did.
+SCHEMA_VERSION: str = "1.1"
 SCHEMA_MAJOR: int = 1
 
 MANIFEST_NAME = "manifest.json"
@@ -129,6 +135,12 @@ class GateResults:
     byte_stream_mismatches: int | None = None
     checks: dict[str, float] = field(default_factory=dict)
     thresholds: dict[str, float] = field(default_factory=dict)
+    #: Where the floors came from: ``"published"``, ``"supplied"`` by the caller, or
+    #: ``"file:<path>"``. Recorded because a floor nobody published is still a floor this
+    #: build cleared, and a reader has to be able to tell which kind they are looking at
+    #: rather than assuming every artifact in the wild was gated against published
+    #: numbers. See :func:`byteify.gates.resolve_thresholds`.
+    thresholds_origin: str = ""
     level: str = ""
     guarantee: str = ""
     declared: dict[str, Any] = field(default_factory=dict)
@@ -162,8 +174,33 @@ class Manifest:
     source_n_layers: int = 0
     trie: TrieRef = field(default_factory=TrieRef)
     byte_stream: dict[str, Any] = field(default_factory=dict)
+    #: What the source repository declared about its pipeline -- module types and the
+    #: pooling config, verbatim. Empty for a plain checkpoint or a custom module, which
+    #: are not sentence-transformers shaped; see :mod:`byteify.sentence_transformers`.
+    source_pipeline: dict[str, Any] = field(default_factory=dict)
+    #: How positions become the output vector. The exported graph bakes this in, so an
+    #: artifact with a non-default ``pooling`` is not interchangeable with one that has
+    #: the default, and a loader that ignored it would serve a different vector space.
+    pooling: str = "mean"
+    #: Whether the output vector is L2-normalised -- whether the source repository ships a
+    #: Normalize module. Recorded rather than assumed because it changes every dot-product
+    #: similarity while leaving cosine untouched, so the error would not appear in the
+    #: metric most callers check first.
+    normalize: bool = True
     gate: GateResults | None = None
     seed: int = 0
+    #: Everything that determined this build, in one object: model, level, seed, training
+    #: parameters, pooling, thresholds and their origin, and a digest of the reference
+    #: data. Two builds that record the same recipe asked for the same artifact.
+    recipe: dict[str, Any] = field(default_factory=dict)
+    #: sha256 of ``recipe`` as canonical JSON. Comparable across builds and across
+    #: machines, because it covers inputs and not the stack they ran on -- ``versions``
+    #: carries that separately.
+    recipe_hash: str = ""
+    #: sha256 of every content file in the artifact, except the manifest itself. This is
+    #: the determinism claim made checkable: rebuild with the same recipe on the same
+    #: stack and these hashes match; change one thing and one does not.
+    content_digest: dict[str, str] = field(default_factory=dict)
     versions: dict[str, str] = field(default_factory=dict)
     exported_at: str = ""
     schema_version: str = SCHEMA_VERSION
@@ -268,6 +305,14 @@ class Manifest:
             errors.append(
                 "byte_stream is empty: inference inputs cannot be built from this manifest"
             )
+        if self.pooling not in SUPPORTED_POOLING:
+            # A manifest declaring a mode this build cannot pool by would otherwise load
+            # and fall back, producing a different vector space than the one it was
+            # graded on. Refusing is the point of recording it.
+            errors.append(
+                f"pooling {self.pooling!r} is not implemented; supported modes are "
+                f"{', '.join(SUPPORTED_POOLING)}"
+            )
         for key in ("layers", "backend", "window", "ffn_hidden", "boundary_predictor"):
             if key not in self.encoder_arch:
                 errors.append(f"encoder_arch is missing {key!r}")
@@ -315,6 +360,39 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def recipe_digest(recipe: dict[str, Any]) -> str:
+    """Canonical sha256 of a recipe, so two builds can be compared in one field.
+
+    Canonical because ``json.dumps`` with sorted keys and no whitespace is the only form
+    that hashes identically for equal content: dict insertion order and float formatting
+    would otherwise make two identical recipes differ.
+    """
+    payload = json.dumps(recipe, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def content_digest(path: Path | str) -> dict[str, str]:
+    """sha256 of every file in an artifact except its manifest.
+
+    The manifest is excluded because it carries ``exported_at`` -- two byte-identical
+    builds differ there by construction -- and because it carries *this* digest, so
+    including it would be hashing a value into itself. Everything else is compared.
+
+    Measured on the synthetic fixture with the same seed in two separate processes:
+    ``encoder.pt``, ``trie.json``, ``artifact.onnx`` and ``artifact.onnx.data`` all came
+    out byte-identical, which is what makes this a claim rather than a hope. (In one
+    process they did not, because the ONNX exporter writes a per-process counter of
+    compiled code objects into a debug stack-trace property; it is metadata, not the
+    model, and it is why the digest is taken across processes.)
+    """
+    directory = Path(path)
+    return {
+        p.name: _sha256(p)
+        for p in sorted(directory.iterdir())
+        if p.is_file() and p.name != MANIFEST_NAME
+    }
+
+
 def read_trie(path: Path) -> dict[int, bytes]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return {int(k): bytes.fromhex(v) for k, v in payload.items()}
@@ -347,7 +425,10 @@ def measure_trie_coverage(token_bytes: dict[int, bytes], texts: list[str]) -> fl
 
 
 def library_versions() -> dict[str, str]:
+    from . import __version__
+
     versions = {
+        "byteify": __version__,
         "python": f"{sys.version_info.major}.{sys.version_info.minor}",
         "platform": platform.platform(),
     }
@@ -373,6 +454,10 @@ def manifest_from_checkpoint(
     token_bytes: dict[int, bytes] | None = None,
     coverage_texts: list[str] | None = None,
     gate: GateResults | None = None,
+    pooling: str = "mean",
+    normalize: bool = True,
+    source_pipeline: dict[str, Any] | None = None,
+    recipe: dict[str, Any] | None = None,
 ) -> Manifest:
     """Build a manifest for an encoder checkpoint.
 
@@ -435,6 +520,9 @@ def manifest_from_checkpoint(
         source_d_model=int(getattr(source, "d_model", d_model)),
         source_n_layers=int(getattr(source, "n_layers", 0)),
         byte_stream=rule.to_dict(),
+        source_pipeline=dict(source_pipeline or {}),
+        pooling=pooling,
+        normalize=bool(normalize),
         trie=TrieRef(
             entries=len(token_bytes or {}),
             coverage=coverage,
@@ -442,6 +530,8 @@ def manifest_from_checkpoint(
         ),
         gate=gate,
         seed=int(config.get("seed", 0)),
+        recipe=dict(recipe or {}),
+        recipe_hash=recipe_digest(recipe) if recipe else "",
         versions=library_versions(),
         exported_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     )
@@ -470,6 +560,10 @@ def export_artifact(
     coverage_texts: list[str] | None = None,
     graph_name: str = GRAPH_NAME,
     example_batch: tuple[Any, Any, Any] | None = None,
+    pooling: str = "mean",
+    normalize: bool = True,
+    source_pipeline: dict[str, Any] | None = None,
+    recipe: dict[str, Any] | None = None,
 ) -> Manifest:
     """Write a complete artifact: graph, trie, encoder weights, manifest.
 
@@ -527,6 +621,10 @@ def export_artifact(
         token_bytes=token_bytes,
         coverage_texts=coverage_texts,
         gate=gate,
+        pooling=pooling,
+        normalize=normalize,
+        source_pipeline=source_pipeline,
+        recipe=recipe,
     )
     manifest = replace(manifest, trie=replace(manifest.trie, sha256=digest))
 
@@ -573,3 +671,44 @@ def load_artifact(
 
     embedder = build_embedder_from_manifest(manifest, artifact_dir, device=device)
     return manifest, embedder
+
+
+def verify_artifact(artifact_dir: Path | str) -> dict[str, Any]:
+    """Recompute an artifact's content digest and compare it with the manifest's.
+
+    This is where "byteify is deterministic" stops being a statement about a build and
+    becomes something a reader can check: the manifest records sha256 for every content
+    file, this recomputes them, and the difference names the file that changed.
+
+    A missing manifest raises, because there is then nothing to verify against -- and a
+    directory with no manifest is not an artifact in this repository's sense at all.
+
+    Returns a dict with ``matches``, ``changed`` (present in both, different hash),
+    ``missing`` (recorded but not on disk), ``extra`` (on disk but unrecorded) and
+    ``actual``. Unrecorded digests -- a manifest written before this existed -- report
+    ``matches: None`` rather than a pass, because "nothing was recorded" is not the same
+    claim as "nothing changed".
+    """
+    artifact_dir = Path(artifact_dir)
+    manifest = Manifest.load(artifact_dir)
+    actual = content_digest(artifact_dir)
+    expected = dict(manifest.content_digest or {})
+
+    changed = sorted(name for name in expected.keys() & actual.keys() if expected[name] != actual[name])
+    missing = sorted(expected.keys() - actual.keys())
+    extra = sorted(actual.keys() - expected.keys())
+
+    if not expected:
+        matches: bool | None = None
+    else:
+        matches = not (changed or missing)
+    return {
+        "artifact": str(artifact_dir),
+        "recipe_hash": manifest.recipe_hash,
+        "matches": matches,
+        "changed": changed,
+        "missing": missing,
+        "extra": extra,
+        "expected": expected,
+        "actual": actual,
+    }

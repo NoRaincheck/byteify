@@ -20,13 +20,61 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+#: The pooling modes a sentence-transformers repository declares, and byteify implements.
+#: Read from a repo's ``1_Pooling/config.json``; see :mod:`byteify.sentence_transformers`.
+SUPPORTED_POOLING = ("mean", "cls", "max", "mean_sqrt", "lasttoken")
 
-def pool_final(h: Tensor, mask: Tensor, final_norm=None) -> Tensor:
-    """Mean-pool over valid positions, matching how the source model pools."""
+
+def pool_positions(h: Tensor, mask: Tensor, mode: str = "mean") -> Tensor:
+    """Pool ``h: [B, N, D]`` over its valid positions into ``[B, D]``.
+
+    One implementation, used on both sides of every fidelity comparison: the teacher
+    pools its token axis and the student pools its patch axis with this same function, so
+    a difference in the measured number is a difference between the two models rather than
+    between two pooling routines.
+
+    ``mean`` is the default because it is what this repository's published floors were
+    measured with, and its arithmetic is unchanged -- ``(h * m).sum(1) / m.sum(1)`` with
+    the same clamp. A mode that is not implemented raises rather than falling back to
+    mean, because silently pooling a CLS model by mean reports a fidelity number about a
+    model the source repository never produced.
+    """
+    m = mask.bool()
+    if mode == "mean":
+        w = m.to(h.dtype).unsqueeze(-1)
+        return (h * w).sum(1) / w.sum(1).clamp_min(1e-6)
+    if mode == "cls":
+        # Position 0. On the teacher's token axis that is the [CLS] token. On the
+        # student's patch axis it is the *first selected patch*, which begins at the
+        # earliest boundary the predictor chose -- usually, but not provably, the CLS
+        # pseudo-byte. That gap is not papered over: it is exactly what the fidelity gate
+        # measures, and a student whose first patch is not where the source reads its CLS
+        # scores badly and is refused.
+        return h[:, 0]
+    if mode == "max":
+        return h.masked_fill(~m.unsqueeze(-1), torch.finfo(h.dtype).min).max(1).values
+    if mode == "mean_sqrt":
+        w = m.to(h.dtype).unsqueeze(-1)
+        count = w.sum(1).clamp_min(1.0)
+        return (h * w).sum(1) / count.sqrt()
+    if mode == "lasttoken":
+        index = (m.long().sum(1) - 1).clamp_min(0)
+        return h.gather(
+            1, index.view(-1, 1, 1).expand(-1, 1, h.shape[-1])
+        ).squeeze(1)
+    raise ValueError(
+        f"pooling mode {mode!r} is not implemented; byteify pools by "
+        f"{', '.join(SUPPORTED_POOLING)}"
+    )
+
+
+def pool_final(
+    h: Tensor, mask: Tensor, final_norm=None, mode: str = "mean"
+) -> Tensor:
+    """Pool over valid positions after the source model's final norm, as it pools."""
     if final_norm is not None:
         h = final_norm(h)
-    m = mask.to(h.dtype).unsqueeze(-1)
-    return (h * m).sum(1) / m.sum(1).clamp_min(1e-6)
+    return pool_positions(h, mask, mode)
 
 
 def pearson(a: Tensor, b: Tensor) -> Tensor:
@@ -82,6 +130,7 @@ def measure_fidelity(
     batches,
     *,
     restore: object | None = None,
+    pooling: str = "mean",
 ) -> dict[str, float]:
     """Measure agreement between the byteified model and the frozen source model.
 
@@ -90,6 +139,11 @@ def measure_fidelity(
     :func:`_oracle_patch_reps` for the trainer; they are different measurements and
     conflating them is how a trainer ends up reporting a number the artifact does not
     reproduce.
+
+    ``pooling`` is the source repository's declared pooling mode. Both sides pool with it,
+    so the metric compares what ``model.encode()`` returns with what the artifact returns
+    rather than what a mean pool of each returns. It defaults to ``mean`` because that is
+    what every floor in ``thresholds.json`` was measured with.
 
     Reports:
 
@@ -114,14 +168,23 @@ def measure_fidelity(
     b_correct = 0.0
     b_total = 0
     depth = source.n_layers
+    # Fail before running, not after: an unimplemented mode would otherwise raise from
+    # inside the loop, and only once the batches had been encoded.
+    if pooling not in SUPPORTED_POOLING:
+        raise ValueError(
+            f"pooling mode {pooling!r} is not implemented; byteify pools by "
+            f"{', '.join(SUPPORTED_POOLING)}"
+        )
 
     for batch in batches:
         patch_reps, patch_mask, probs = patches_for(batch)
         teacher = source.representation_at(batch.input_ids, batch.attention_mask, depth)
         student = source.forward_layers(patch_reps, patch_mask, n_layers=depth)
 
-        s = pool_final(student, patch_mask, source.final_norm)
-        t = pool_final(teacher, batch.attention_mask.bool(), source.final_norm)
+        s = pool_final(student, patch_mask, source.final_norm, mode=pooling)
+        t = pool_final(
+            teacher, batch.attention_mask.bool(), source.final_norm, mode=pooling
+        )
         s_pooled.append(s.cpu())
         t_pooled.append(t.cpu())
 

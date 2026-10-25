@@ -101,8 +101,69 @@ def thresholds_for(source_id: str) -> Thresholds:
         f"Fidelity numbers do not transfer between architectures, so byteify will not "
         f"measure this model against another one's floors.\n"
         f"Measure it first (see RESULTS.md) and add an entry to "
-        f"byteify/assets/{THRESHOLD_RESOURCE}."
+        f"byteify/assets/{THRESHOLD_RESOURCE}, or pass thresholds explicitly -- "
+        f"thresholds=Thresholds(...) or thresholds=path/to/floors.json."
     )
+
+
+def resolve_thresholds(
+    source_id: str, supplied: Thresholds | str | Path | None = None
+) -> tuple[Thresholds, str]:
+    """The floors to gate on, and where they came from.
+
+    Two ways to have thresholds, one guarantee about each. A model may use the floors
+    published for it, or the caller may supply floors measured for it; neither may use
+    *someone else's*. The second form is what makes a source model with no published
+    entry byteifiable at all -- without it "byteify anything" would mean "byteify the two
+    models in ``thresholds.json``" -- and it does not weaken the gate, because the floors
+    are still numbers this build has to clear. What it changes is who vouches for them,
+    so the origin is returned and recorded rather than being left to look published.
+
+    ``supplied`` is a :class:`Thresholds`, or a path to a JSON object of the same field
+    names (an entry copied out of ``thresholds.json`` is exactly such an object).
+    """
+    if supplied is None:
+        return thresholds_for(source_id), "published"
+    if isinstance(supplied, (str, Path)):
+        path = Path(supplied)
+        if not path.exists():
+            raise FileNotFoundError(f"no thresholds file at {path}")
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path} is not valid JSON: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise TypeError(
+                f"{path} must be a JSON object of threshold fields "
+                f"({', '.join(Thresholds.__dataclass_fields__)})"
+            )
+        # An entry may be nested under the model id, as thresholds.json is.
+        if set(raw) == {source_id} and isinstance(raw[source_id], dict):
+            raw = raw[source_id]
+        known = Thresholds.from_dict(raw)
+        # The failure this guards: `from_dict` keeps only known keys, so a file with
+        # mistyped names -- or one holding nothing but a note -- would produce a
+        # Thresholds of all defaults, i.e. floors of zero that clear unconditionally.
+        # That is a gate that cannot fail, and it would be recorded as one that did, so
+        # the three fidelity floors have to be *stated* before any of them can be used.
+        required = ("cos_emb_c", "sim_corr", "boundary_acc")
+        missing = [name for name in required if name not in raw]
+        if missing:
+            raise ValueError(
+                f"{path} does not state {', '.join(missing)}; a supplied thresholds file "
+                f"must name every fidelity floor it is asking byteify to gate on. "
+                f"Expected fields: {', '.join(sorted(Thresholds.__dataclass_fields__))}"
+            )
+        origin = f"file:{path}"
+    elif isinstance(supplied, Thresholds):
+        known = supplied
+        origin = "supplied"
+    else:
+        raise TypeError(
+            f"thresholds must be a Thresholds, a path to one, or None; got "
+            f"{type(supplied).__name__}"
+        )
+    return known, origin
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,12 +254,14 @@ def check_fidelity(
     source,
     batches,
     thresholds: Thresholds,
+    pooling: str = "mean",
 ) -> dict[str, float]:
     """Boundary agreement and similarity structure, centred."""
     from .fidelity import _budgeted_patch_reps, measure_fidelity
 
     metrics = measure_fidelity(
-        lambda batch: _budgeted_patch_reps(embedder, batch), source, batches
+        lambda batch: _budgeted_patch_reps(embedder, batch), source, batches,
+        pooling=pooling,
     )
     report.add("cos_emb_c", metrics["cos_emb_c"], thresholds.cos_emb_c)
     report.add("sim_corr", metrics["sim_corr"], thresholds.sim_corr)

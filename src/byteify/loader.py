@@ -69,11 +69,17 @@ def build_embedder_from_manifest(
     load_encoder_state(encoder, torch.load(weights_path, map_location=device, weights_only=True))
     encoder.eval()
 
+    # pooling and normalize come from the manifest rather than from byteify's defaults:
+    # they are what the source repository declared, they are baked into the exported
+    # graph, and serving with different ones would return a vector space the gates never
+    # graded. A manifest predating them carries neither field, so it reads back as mean
+    # pooling with normalisation -- what every artifact through schema 1.0 described.
     embedder = ByteifiedEmbedder(
         encoder,
         source,
         n_patches=manifest.budget,
-        normalize=True,
+        pooling=manifest.pooling,
+        normalize=manifest.normalize,
     ).to(device)
 
     # The trie and the byte-stream rule are what turn text into graph inputs with no

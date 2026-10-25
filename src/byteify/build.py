@@ -16,23 +16,34 @@ with directories full of things that look deployable and are not.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import shutil
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .bytestream import rule_for_family
 from .gates import (
     GateReport,
+    Thresholds,
     check_coverage,
     check_exported_graph,
     check_fidelity,
     check_lossless_byte_stream,
     check_retrieval,
     require_retrieval_floor,
-    thresholds_for,
+    resolve_thresholds,
 )
 from .levels import declare, resolve_level
-from .manifest import GateResults, Manifest, export_artifact, measure_trie_coverage
+from .manifest import (
+    GateResults,
+    Manifest,
+    content_digest,
+    export_artifact,
+    measure_trie_coverage,
+    recipe_digest,
+)
 
 #: Bolmo's compression ratio on English prose. Used to fit a patch budget to a byte axis;
 #: see `_fit_patch_budget`.
@@ -49,8 +60,9 @@ def build_artifact(
     *,
     model: str,
     level: str,
-    data: list[str],
     output_dir: Path,
+    data: list[str] | None = None,
+    texts: list[str] | None = None,
     steps: int = 2000,
     batch_size: int = 4,
     max_bytes: int = 512,
@@ -63,16 +75,33 @@ def build_artifact(
     device: str | None = None,
     judgements: str | None = None,
     delta_from: str | None = None,
+    thresholds: Thresholds | str | Path | None = None,
     dry_run: bool = False,
     quiet: bool = False,
+    log: Callable[[str], None] | None = None,
 ) -> Manifest:
-    """Produce a byteified artifact, or raise. Never returns a failed one."""
+    """Produce a byteified artifact, or raise. Never returns a failed one.
+
+    This is the library entry point as much as it is the body of ``byteify build``: it
+    takes a model id or local directory, returns the written :class:`Manifest`, and is
+    silent unless given ``log=``. Nothing about it requires the command line.
+
+    ``data`` is a list of files to read reference text from and ``texts`` is reference
+    text already in memory; exactly one is required, because inferring which a caller
+    meant from a list of strings that might be either would silently train on paths.
+
+    ``thresholds`` is ``None`` for the model's published floors, or a :class:`Thresholds`
+    / path to one measured for *this* model. Supplying them is what makes a source model
+    with no published entry byteifiable at all; see :func:`byteify.gates.resolve_thresholds`
+    for why borrowing another model's floors stays impossible either way.
+    """
     import torch
 
     from .alignment import discover_special_bytes
     from .data import truncate_to_bytes
     from .hub import resolve_source_model, resolve_source_tokenizer
     from .inference import ByteifiedEmbedder
+    from .sentence_transformers import read_pipeline
     from .source import (
         HuggingFaceSourceEncoder,
         LocalEncoderSpec,
@@ -90,19 +119,35 @@ def build_artifact(
     )
     from .vocab import resolve_token_bytes
 
+    if (data is None) == (texts is None):
+        raise ValueError(
+            "give exactly one of data= (files to read reference text from) or texts= "
+            "(reference text already in memory)"
+        )
+
     def say(message: str = "") -> None:
-        if not quiet:
+        if log is not None:
+            log(message)
+        elif not quiet:
             print(message, flush=True)
 
     started = time.perf_counter()
     chosen = resolve_level(level)
 
     # -- 1. refuse early ------------------------------------------------------
-    thresholds = thresholds_for(model)
-    texts = load_reference_texts(data, limit=4000 + 256)
-    if len(texts) < 64:
+    # Thresholds first: resolving them reads one packaged file, so an unknown model is
+    # refused in milliseconds with no network call -- the contract that "an unknown model
+    # is refused here, in seconds, rather than after hours of training" rests on. The
+    # pipeline is read next because a repository that declares one byteify cannot
+    # reproduce must also be refused before any training is scheduled.
+    thresholds, thresholds_origin = resolve_thresholds(model, thresholds)
+    pipeline = read_pipeline(model)
+    reference: list[str] = (
+        list(texts) if texts is not None else load_reference_texts(data, limit=4000 + 256)
+    )
+    if len(reference) < 64:
         raise ValueError(
-            f"reference data yielded {len(texts)} usable texts; at least 64 are needed to "
+            f"reference data yielded {len(reference)} usable texts; at least 64 are needed to "
             "hold some out for evaluation"
         )
     graded = load_judgements(judgements)
@@ -127,7 +172,15 @@ def build_artifact(
     say(f"byteify {chosen.name}: {model}")
     say(f"  thresholds  cos_emb_c >= {thresholds.cos_emb_c}, "
         f"sim_corr >= {thresholds.sim_corr}, boundary_acc >= {thresholds.boundary_acc}")
-    say(f"  reference   {len(texts)} texts from {', '.join(data)}")
+    if thresholds_origin != "published":
+        # Said out loud because the artifact will record it too, and a reader should never
+        # have to discover from a manifest that the floors under a build were not
+        # published ones.
+        say(f"              {thresholds_origin}: supplied for {model} rather than "
+            f"published; the manifest records that")
+    say(f"  pipeline    {pipeline.describe()}")
+    say(f"  reference   {len(reference)} texts from "
+        f"{', '.join(data) if data else 'the caller'}")
     patch_budget = _fit_patch_budget(patch_budget, max_bytes=max_bytes, say=say)
 
     estimate = steps * 0.12  # measured on the 16.8M anchor on MPS
@@ -161,6 +214,40 @@ def build_artifact(
 
     torch.manual_seed(seed)
     device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
+
+    # Everything that determined this build, in one object. Recorded so two builds can be
+    # compared on what they were *asked* for -- a digest of the reference data included,
+    # because "same recipe, different corpus" is not the same artifact and a recipe that
+    # could not tell them apart would be a recipe that cannot be checked.
+    recipe = {
+        "model": model,
+        "level": chosen.name,
+        "seed": seed,
+        "device": device,
+        "steps": steps,
+        "batch_size": batch_size,
+        "max_bytes": max_bytes,
+        "patch_budget": patch_budget,
+        "local_layers": local_layers,
+        "local_ffn": local_ffn,
+        "local_window": local_window,
+        "lr": lr,
+        "pooling": pipeline.pooling,
+        "normalize": pipeline.normalize,
+        "thresholds": {
+            "cos_emb_c": thresholds.cos_emb_c,
+            "sim_corr": thresholds.sim_corr,
+            "boundary_acc": thresholds.boundary_acc,
+            "onnx_max_abs_diff": thresholds.onnx_max_abs_diff,
+            "trie_coverage": thresholds.trie_coverage,
+            "retrieval_recall_at_1": thresholds.retrieval_recall_at_1,
+        },
+        "thresholds_origin": thresholds_origin,
+        "reference_digest": texts_digest(reference),
+        "judgements_digest": path_digest(judgements),
+        "delta_from": delta_from,
+    }
+    say(f"  recipe      {recipe_digest(recipe)[:16]}... over {len(recipe)} inputs")
 
     # Weights and vocabulary resolve through the same route, for the same reason: a build
     # that read the encoder from one layout and the vocabulary from another would train a
@@ -202,7 +289,9 @@ def build_artifact(
         seed=seed,
         device=device,
     )
-    result = train_stage1(encoder, source, tokenizer, texts, cfg, log=say)
+    result = train_stage1(
+        encoder, source, tokenizer, reference, cfg, pooling=pipeline.pooling, log=say
+    )
 
     checkpoint = output_dir.parent / "checkpoint.pt"
     save_checkpoint(checkpoint, result.state_dict, {**result.config, **spec.to_config(), "model": model})
@@ -212,8 +301,9 @@ def build_artifact(
 
         say(f"\nlevel {chosen.index}: contrastive on the supplied corpus")
         result.state_dict = train_contrastive_on_corpus(
-            encoder, source, tokenizer, texts,
-            steps=max(steps // 4, 50), seed=seed, device=device, log=say,
+            encoder, source, tokenizer, reference,
+            steps=max(steps // 4, 50), seed=seed, device=device,
+            pooling=pipeline.pooling, log=say,
         )
         load_encoder_state(encoder, result.state_dict, source="contrastive stage")
 
@@ -240,13 +330,14 @@ def build_artifact(
     # One slice, two uses: trie coverage and the fidelity gate grade the same held-out
     # texts, so the count is written once. Two literals that have to agree, and a gate that
     # quietly graded fewer texts than it promised, is what that invites.
-    coverage_texts = [truncate_to_bytes(t, max_bytes) for t in texts[:GATE_TEXTS]]
+    coverage_texts = [truncate_to_bytes(t, max_bytes) for t in reference[:GATE_TEXTS]]
     coverage = measure_trie_coverage(token_bytes, coverage_texts)
     gate_texts = coverage_texts
     check_lossless_byte_stream(report, tokenizer=tokenizer, rule=rule, texts=gate_texts)
 
     embedder = ByteifiedEmbedder(
-        encoder, source, n_patches=min(patch_budget, max_bytes)
+        encoder, source, n_patches=min(patch_budget, max_bytes),
+        pooling=pipeline.pooling, normalize=pipeline.normalize,
     ).to(device).eval()
     _, trie, _ = _tables(tokenizer)
 
@@ -260,7 +351,8 @@ def build_artifact(
         for i in range(0, len(gate_texts) - batch_size + 1, batch_size)
     ]
     metrics = check_fidelity(
-        report, embedder=embedder, source=source, batches=gate_batches, thresholds=thresholds
+        report, embedder=embedder, source=source, batches=gate_batches,
+        thresholds=thresholds, pooling=pipeline.pooling,
     )
     check_coverage(report, coverage, thresholds)
 
@@ -314,6 +406,10 @@ def build_artifact(
         coverage_texts=coverage_texts,
         gate=None,
         example_batch=graph_inputs,
+        pooling=pipeline.pooling,
+        normalize=pipeline.normalize,
+        source_pipeline=pipeline.as_manifest(),
+        recipe=recipe,
     )
 
     diff = check_exported_graph(
@@ -331,18 +427,53 @@ def build_artifact(
     recorded = GateResults.from_dict({
         **report.record(),
         **declare(chosen, thresholds, report.extra.get("fidelity", metrics)),
+        "thresholds_origin": thresholds_origin,
         "fidelity": report.extra.get("fidelity", {}),
         "byte_stream_mismatches": report.extra.get("byte_stream_mismatches"),
         "retrieval": None if retrieval is None else retrieval["recall@1"],
         "retrieval_detail": retrieval or {},
     })
-    manifest = Manifest.from_dict({**manifest.to_dict(), "gate": recorded.to_dict()})
+    # Taken here, after every content file exists and before the manifest -- which is
+    # excluded from it -- is written. This is the determinism claim in a form a reader can
+    # re-check with `verify_artifact`.
+    digest = content_digest(output_dir)
+    manifest = Manifest.from_dict({
+        **manifest.to_dict(),
+        "gate": recorded.to_dict(),
+        "content_digest": digest,
+    })
     manifest.write_to(output_dir / "manifest.json")
 
     checkpoint.unlink(missing_ok=True)
     say(f"  onnx vs eager: max |diff| {diff:.2e}")
+    say(f"  content      {len(digest)} files hashed; verify with byteify.verify_artifact")
     say(f"\ndone in {time.perf_counter() - started:.0f}s -> {output_dir}")
     return manifest
+
+
+def texts_digest(texts: list[str]) -> str:
+    """sha256 of reference text in order, as the data half of a recipe.
+
+    Ordered and hashed whole rather than counted: two corpora of 4000 texts are not the
+    same corpus, and a recipe that recorded only a length could not tell them apart.
+    """
+    payload = json.dumps(texts, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def path_digest(path: str | None) -> str:
+    """sha256 of a supplied file, or empty when there is none.
+
+    Same reasoning as :func:`texts_digest` for judgements and deltas: the file's *content*
+    is what a build used, and recording only its name would let an edited judgements file
+    keep the recipe it no longer matches.
+    """
+    if not path:
+        return ""
+    p = Path(path)
+    if not p.is_file():
+        return ""
+    return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
 def _tables(tokenizer):

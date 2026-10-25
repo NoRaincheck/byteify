@@ -72,7 +72,9 @@ def _lr_at(step: int, cfg: Stage1Config) -> float:
 
 
 @torch.no_grad()
-def _fidelity(encoder, source, batches) -> dict[str, float]:
+def _fidelity(
+    encoder, source, batches, pooling: str = "mean"
+) -> dict[str, float]:
     """Held-out fidelity of a bare ``ByteifiedEncoder``, under oracle boundaries.
 
     Oracle, not budgeted: Stage 1 pools with the true subword boundaries so the patch axis
@@ -80,12 +82,17 @@ def _fidelity(encoder, source, batches) -> dict[str, float]:
     describe. The gate measures budgeted patching instead, because that is what the
     exported graph does. Two different measurements of two different things, reported as
     such.
+
+    ``pooling`` is the source repository's declared mode, so the trainer reports the same
+    quantity the gate will grade: both sides pool the way the source pools.
     """
     from .fidelity import _oracle_patch_reps
 
     was_training = encoder.training
     encoder.eval()
-    metrics = measure_fidelity(lambda batch: _oracle_patch_reps(encoder, batch), source, batches)
+    metrics = measure_fidelity(
+        lambda batch: _oracle_patch_reps(encoder, batch), source, batches, pooling=pooling
+    )
     if was_training:
         encoder.train()
     return metrics
@@ -98,6 +105,7 @@ def train_stage1(
     texts: list[str],
     cfg: Stage1Config,
     *,
+    pooling: str = "mean",
     log=lambda message: None,
 ) -> Stage1Result:
     """Run Stage 1 and return the trained state dict plus its held-out metrics."""
@@ -195,7 +203,7 @@ def train_stage1(
             step += 1
 
             if step % cfg.eval_every == 0 or step == cfg.steps:
-                metrics = _fidelity(encoder, source, eval_batches)
+                metrics = _fidelity(encoder, source, eval_batches, pooling=pooling)
                 history.append({"step": step, **metrics})
                 log(
                     f"  step {step:>6}  held-out: sim_corr={metrics['sim_corr']:.3f} "

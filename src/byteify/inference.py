@@ -17,9 +17,11 @@ and it degrades gracefully in both directions: if the predictor is confident abo
 boundaries the surplus slots are masked from pooling, and if it is confident about more
 than the budget, the extra ones are dropped and their patches merge.
 
-**Embeddings must be pooled consistently.** The model's sentence embedding is mean
-pooling after the source encoder's output norm, matching how the source model and
-``sentence-transformers`` pool. Padding patches are excluded from the mean.
+**Embeddings must be pooled consistently.** The model's sentence embedding is pooled
+after the source encoder's output norm, by the mode the source repository declares -- see
+:mod:`byteify.sentence_transformers`. The default is masked mean, which is what
+mean-pooled sentence-transformers models and this repository's published floors both use;
+padding patches are excluded from every mode.
 
 The ONNX export traces the *whole* embedding path: byte embedding, local encoder,
 boundary predictor, budgeted pooling, the frozen global model, output norm, mean pool.
@@ -40,6 +42,7 @@ from torch import Tensor, nn
 
 from .bytestream import fits_byte_axis
 from .expand import expand_byte_ids
+from .fidelity import pool_positions
 
 
 def budgeted_patches_mask(mask: Tensor) -> Tensor:
@@ -157,6 +160,7 @@ class ByteifiedEmbedder(nn.Module):
         n_patches: int = 128,
         threshold: float = 0.5,
         normalize: bool = True,
+        pooling: str = "mean",
         byte_trie=None,
         byte_stream_rule=None,
         byte_axis: int = 512,
@@ -167,6 +171,10 @@ class ByteifiedEmbedder(nn.Module):
         self.n_patches = n_patches
         self.threshold = threshold
         self.normalize = normalize
+        #: How positions become one vector, from the source repository's declaration. The
+        #: exported graph bakes this in, so the artifact reproduces what ``encode()`` on
+        #: the source returns rather than what byteify's own default returns.
+        self.pooling = pooling
         # Set when the embedder was loaded from an artifact, which is what lets it turn
         # text into graph inputs with no tokenizer present.
         self.byte_trie = byte_trie
@@ -222,7 +230,8 @@ class ByteifiedEmbedder(nn.Module):
     def forward(self, byte_ids: Tensor, expanded_ids: Tensor, byte_mask: Tensor) -> Tensor:
         n = min(self.n_patches, byte_ids.shape[1])
         embedding = _embedder_core(
-            self.encoder, self.source, byte_ids, expanded_ids, byte_mask, n, self.threshold
+            self.encoder, self.source, byte_ids, expanded_ids, byte_mask, n,
+            self.threshold, pooling=self.pooling,
         )
         return F.normalize(embedding, dim=-1) if self.normalize else embedding
 
@@ -289,11 +298,14 @@ def _embedder_core(
     byte_mask: Tensor,
     n_patches: int,
     threshold: float,
+    pooling: str = "mean",
 ) -> Tensor:
     """The shared inference path, used by both eager forward and the ONNX wrapper.
 
     Kept as one function so the exported graph and the eager path cannot drift: they
     execute the same ops in the same order, which is what makes the export verifiable.
+    ``pooling`` is part of that contract -- it is read from the source repository's
+    declaration and baked into the graph, so both sides pool the way the source pools.
     """
     e = encoder.embed(byte_ids, expanded_ids)
     h = encoder.local_encoder(e, byte_mask)
@@ -305,8 +317,7 @@ def _embedder_core(
     hidden = source.forward_layers(patch_reps, patches.mask.long(), n_layers=source.n_layers)
     if source.final_norm is not None:
         hidden = source.final_norm(hidden)
-    m = patches.mask.to(hidden.dtype).unsqueeze(-1)
-    return (hidden * m).sum(1) / m.sum(1).clamp_min(1e-6)
+    return pool_positions(hidden, patches.mask, pooling)
 
 
 def export_onnx(
@@ -395,6 +406,7 @@ class _ExportWrapper(nn.Module):
     def forward(self, byte_ids: Tensor, expanded_ids: Tensor, byte_mask: Tensor) -> Tensor:
         e = self.embedder
         out = _embedder_core(
-            e.encoder, e.source, byte_ids, expanded_ids, byte_mask, self.n_patches, e.threshold
+            e.encoder, e.source, byte_ids, expanded_ids, byte_mask, self.n_patches,
+            e.threshold, pooling=e.pooling,
         )
         return F.normalize(out, dim=-1) if e.normalize else out

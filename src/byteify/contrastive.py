@@ -188,6 +188,7 @@ def train_contrastive_on_corpus(
     max_bytes: int = 512,
     seed: int = 0,
     device: str = "cpu",
+    pooling: str = "mean",
     log=lambda message: None,
 ) -> dict:
     """Fit the byte interface to the similarity structure of a corpus.
@@ -199,6 +200,10 @@ def train_contrastive_on_corpus(
     Positives are mined in the *source* model's space, so the pairs reflect real semantic
     similarity rather than whatever the byte interface currently believes. Returns the
     encoder's new state dict.
+
+    ``pooling`` keeps both spaces on the source's declared pooling mode: pairs are mined
+    from pooled source embeddings and the student is trained against pooled student ones,
+    so a CLS-pooled model mines and grades CLS pools rather than mean ones.
     """
     import torch
     import torch.nn.functional as F
@@ -213,7 +218,9 @@ def train_contrastive_on_corpus(
 
     torch.manual_seed(seed)
     encoder.to(device).train()
-    embedder = ByteifiedEmbedder(encoder, source, n_patches=min(64, max_bytes)).to(device)
+    embedder = ByteifiedEmbedder(
+        encoder, source, n_patches=min(64, max_bytes), pooling=pooling
+    ).to(device)
 
     def source_embeddings(batch_texts: list[str]) -> torch.Tensor:
         rows = encode_texts(
@@ -227,6 +234,7 @@ def train_contrastive_on_corpus(
                 source.representation_at(rows.input_ids, rows.attention_mask, source.n_layers),
                 rows.attention_mask.bool(),
                 source.final_norm,
+                mode=pooling,
             )
 
     pairs = mine_pairs(
@@ -253,7 +261,10 @@ def train_contrastive_on_corpus(
     def embed(batch_rows) -> torch.Tensor:
         reps, mask, _ = _budgeted_patch_reps(embedder, batch_rows)
         hidden = source.forward_layers(reps, mask, n_layers=source.n_layers)
-        return F.normalize(pool_final(hidden, mask, source.final_norm), dim=-1)
+        # Normalised regardless of the artifact's own normalize flag: this is InfoNCE,
+        # which needs unit vectors to have the temperature it learns any meaning. The
+        # artifact's output space is a serving decision and does not apply here.
+        return F.normalize(pool_final(hidden, mask, source.final_norm, mode=pooling), dim=-1)
 
     for done, batch in enumerate(pair_batches(pairs, batch_size, seed=seed), start=1):
         if done > steps:
